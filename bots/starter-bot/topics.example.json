@@ -1,0 +1,6 @@
+{
+  "topics": [
+    { "name": "健身训练分卷", "file": "fitness.md", "keywords": ["健身", "训练", "跑步", "gym"] },
+    { "name": "读书笔记分卷", "file": "reading.md", "keywords": ["读书", "书单", "笔记"] }
+  ]
+}

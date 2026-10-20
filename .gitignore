@@ -1,0 +1,30 @@
+# 依赖与环境
+node_modules/
+__pycache__/
+*.pyc
+.env
+
+# 隐私配置与动态认证凭证 (绝不上云)
+**/config.json
+!**/config.example.json
+**/tasks.js
+!**/tasks.example.js
+bilibili_config.json
+!bilibili_config.example.json
+
+# 媒体下载临时文件与二维码
+**/downloads/*
+!**/downloads/.gitkeep
+**/qrcode.png
+
+# 对话与运行历史记录
+**/chat_history.log
+**/reminders.json
+!**/reminders.example.json
+**/scheduler_state.json
+
+# 编译与构建输出
+dist/
+*.tar.gz
+*.zip
+.DS_Store
