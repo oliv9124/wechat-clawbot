@@ -5,7 +5,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, saveConfig } from './wechat_reply.js';
+import { loadConfig, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT } from './wechat_reply.js';
+import { enqueueInbox } from './inbox.js';
+import { raiseAlert } from './alert.js';
+
+// 凭证过期后多久再试一次：退出重启只会每几秒撞一次接口，没有意义（环境变量仅供测试缩短）
+const CREDENTIAL_RETRY_MS = Number(process.env.FORWARDER_CREDENTIAL_RETRY_MS) || 10 * 60 * 1000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
@@ -73,7 +78,7 @@ async function downloadAndDecryptMedia(itemObj, defaultExt = '.bin', customFileN
     const rawAesKey = itemObj.aeskey || media.aes_key;
     const key = parseAesKey(rawAesKey);
     if (!key) {
-      console.error('[下载解密媒体] 无法解析 AES Key:', rawAesKey);
+      console.error(`[下载解密媒体] 无法解析 AES Key（长度 ${String(rawAesKey || '').length}）`);
       return null;
     }
 
@@ -86,7 +91,7 @@ async function downloadAndDecryptMedia(itemObj, defaultExt = '.bin', customFileN
       return null;
     }
 
-    console.log(`[正在从腾讯 CDN 下载媒体]: ${downloadUrl.slice(0, 80)}...`);
+    console.log(`[正在从腾讯 CDN 下载媒体]: ${URL.canParse(downloadUrl) ? new URL(downloadUrl).host : '（地址无法解析）'}`);
     const res = await fetch(downloadUrl);
     if (!res.ok) {
       console.error('[下载媒体失败]: HTTP', res.status);
@@ -101,7 +106,7 @@ async function downloadAndDecryptMedia(itemObj, defaultExt = '.bin', customFileN
       : `wx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${defaultExt}`;
     const filePath = path.join(destDir, safeName);
     fs.writeFileSync(filePath, decryptedBytes);
-    console.log(`[媒体已成功解密落盘]: ${filePath} (${decryptedBytes.length} 字节)`);
+    console.log(`[媒体已成功解密落盘]: ${describePath(filePath)} (${decryptedBytes.length} 字节)`);
     return filePath;
   } catch (err) {
     console.error('[下载解密媒体异常]:', err.message);
@@ -109,60 +114,37 @@ async function downloadAndDecryptMedia(itemObj, defaultExt = '.bin', customFileN
   }
 }
 
-async function forwardToRoutine(webhookUrl, webhookKey, payload, maxRetries = 3) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const res = await fetch(webhookUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${webhookKey}`,
-        },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Webhook POST failed (${res.status}): ${errText}`);
-      }
-      return await res.json();
-    } catch (err) {
-      lastErr = err;
-      const detail = err.cause ? (err.cause.code || err.cause.message) : err.message;
-      if (attempt < maxRetries) {
-        console.warn(`[转发至 Routine 重试 ${attempt}/${maxRetries}] 遇到: ${detail}，2秒后重试...`);
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-    }
-  }
-  throw lastErr;
-}
-
 async function startPolling() {
   let config = loadConfig();
 
+  // 没有凭证也不退出（退出只会被 systemd 每几秒拉起一次）：下面的循环会告警，并每 10 分钟检查一次
   if (!config.bot_token) {
     console.error('❌ 未检测到登录凭证 (bot_token)！请先运行 "node login.js" 进行扫码绑定。');
-    process.exit(1);
   }
 
   const baseUrl = (config.base_url || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
-  const webhookUrl = config.webhook_url || 'http://127.0.0.1:18888/webhook/wechat';
-  const webhookKey = config.webhook_key || '';
 
   console.log(`[转发程序已启动] 正在通过 iLink 长轮询监听微信消息...`);
-  console.log(`已绑定用户: ${config.authorized_user_id || '等待首位用户消息自动锁定'}`);
-  console.log(`下旨入口 Webhook: ${webhookUrl}`);
+  console.log(`已绑定用户: ${config.authorized_user_id || '（未绑定，将拒收所有消息，请运行 login.js 扫码绑定）'}`);
+  console.log(`消息收件箱: ${path.join(botRoot, 'data', 'inbox', 'pending')}`);
 
-  let getUpdatesBuf = config.get_updates_buf || '';
+  let getUpdatesBuf = loadRuntimeState('forwarder').get_updates_buf || '';
+  // 登录状态：unknown（刚启动）/ ok / expired。变成 expired 时告警一次；之后第一次拉取成功就报"正常"。
+  // 刚启动时也报一次"正常"：主人重新扫码后服务会重启，监控靠这一条知道已经恢复
+  let credentialState = 'unknown';
 
   while (true) {
     try {
       config = loadConfig(); // 每次轮询前刷新配置
       const token = config.bot_token;
       if (!token) {
-        console.error('❌ 凭证丢失，停止轮询。');
-        break;
+        console.error('❌ 配置里没有登录凭证，请重新扫码登录。稍后再检查。');
+        if (credentialState !== 'expired') {
+          credentialState = 'expired';
+          raiseAlert('credential_expired', '配置里没有登录凭证（bot_token）');
+        }
+        await new Promise((r) => setTimeout(r, CREDENTIAL_RETRY_MS));
+        continue;
       }
 
       const endpoint = `${baseUrl}/ilink/bot/getupdates`;
@@ -190,11 +172,15 @@ async function startPolling() {
 
       const data = await res.json();
 
-      // 检查错误码
+      // 检查错误码：凭证过期时发一次告警，然后放慢到每 10 分钟试一次，等主人重新扫码
       if (data.errcode === -14) {
-        console.error('\n⚠️ [凭证过期] 接口返回错误码 -14（Session 已过期或未授权）。');
-        console.error('请重新执行扫码命令刷新凭证！');
-        break;
+        console.error(`\n⚠️ [凭证过期] 接口返回错误码 -14（Session 已过期或未授权），请重新扫码登录。${Math.round(CREDENTIAL_RETRY_MS / 1000)} 秒后再试。`);
+        if (credentialState !== 'expired') {
+          credentialState = 'expired';
+          raiseAlert('credential_expired', '微信接口返回 -14（登录已过期）');
+        }
+        await new Promise((r) => setTimeout(r, CREDENTIAL_RETRY_MS));
+        continue;
       }
 
       if (data.ret !== 0 && data.errcode) {
@@ -203,37 +189,52 @@ async function startPolling() {
         continue;
       }
 
-      // 更新同步游标
-      if (data.get_updates_buf) {
-        getUpdatesBuf = data.get_updates_buf;
-        saveConfig({ get_updates_buf: getUpdatesBuf });
+      if (credentialState !== 'ok') {
+        if (credentialState === 'expired') console.log('[凭证恢复] 微信接口恢复正常');
+        credentialState = 'ok';
+        raiseAlert('credential_ok', '微信接口正常');
       }
 
-      // 处理收到的消息
+      // 处理收到的消息：每条先落进收件箱，整批都落盘后才推进同步游标（见循环后）
       const msgs = data.msgs || [];
+      const seenIds = new Set(loadRuntimeState('forwarder').recent_message_ids || []);
+      let latestContextToken = null;
+      let latestUserMessageAt = 0;
       for (const msg of msgs) {
-        console.log(`[iLink 接收到完整事件]:`, JSON.stringify(msg, null, 2));
+        // 默认只记事件概要；完整事件里有消息原文、context_token 和媒体解密密钥
+        const itemTypes = (msg.item_list || []).map((i) => i.type).join(',') || '无';
+        console.log(`[iLink 收到事件] message_id=${msg.message_id} from=${msg.from_user_id} 内容类型=${itemTypes}`);
+        if (LOG_CONTENT) console.log(`[iLink 完整事件]:`, JSON.stringify(msg, null, 2));
 
         const fromUser = msg.from_user_id;
         if (!fromUser) {
           continue;
         }
 
-        // 仅处理绑定的用户
-        let authorizedUser = config.authorized_user_id;
+        // 仅处理扫码登录时绑定的用户；未绑定时一律拒收，不再把第一个发消息的人自动设为主人
+        const authorizedUser = config.authorized_user_id;
         if (!authorizedUser) {
-          authorizedUser = fromUser;
-          saveConfig({ authorized_user_id: fromUser });
-          console.log(`[首次绑定] 成功锁定授权用户: ${fromUser}`);
-        } else if (fromUser !== authorizedUser) {
+          console.warn(`[拒收消息] 当前实例未绑定授权用户，已忽略 ${fromUser} 的消息。请在实例目录运行 node ../../core/login.js 重新扫码绑定。`);
+          continue;
+        }
+        if (fromUser !== authorizedUser) {
           console.log(`[过滤非绑定用户] 收到非授权用户 (${fromUser}) 的消息，已安全忽略。`);
           continue;
         }
 
-        // 保存最新的 context_token
-        if (msg.context_token) {
-          saveConfig({ last_context_token: msg.context_token });
+        // 同一条消息（重新拉取时可能再来一次）只收一次。message_id 超出 JS 安全整数范围，
+        // 解析后低位会丢精度，所以和 create_time_ms 拼在一起作为去重键
+        const messageId = `${msg.message_id ?? fromUser}-${msg.create_time_ms ?? ''}`;
+        if (seenIds.has(messageId)) {
+          console.log(`[去重] 消息 ${messageId} 已经收过，跳过。`);
+          continue;
         }
+
+        if (msg.context_token) {
+          latestContextToken = msg.context_token;
+        }
+        // 对方最近一次发消息的时间：微信只允许机器人在这之后约 24 小时内主动发消息，调度器据此提醒对方回一句
+        latestUserMessageAt = Math.max(latestUserMessageAt, Number(msg.create_time_ms) || Date.now());
 
         // 提取文本内容与各类媒体（图片、语音、文档文件、视频）
         const items = msg.item_list || [];
@@ -258,7 +259,7 @@ async function startPolling() {
           else if (item.type === 3 && item.voice_item) {
             if (item.voice_item.text) {
               voiceTexts.push(item.voice_item.text.trim());
-              console.log(`[微信语音识别 ASR]: "${item.voice_item.text}"`);
+              console.log(`[微信语音识别 ASR]: ${describeText(item.voice_item.text)}`);
             }
             const voicePath = await downloadAndDecryptMedia(item.voice_item, '.silk');
             if (voicePath && !item.voice_item.text) {
@@ -272,7 +273,7 @@ async function startPolling() {
             const filePath = await downloadAndDecryptMedia(item.file_item, ext, fileName);
             if (filePath) {
               filePaths.push({ path: filePath, name: fileName });
-              console.log(`[微信接收文件]: ${fileName} -> ${filePath}`);
+              console.log(`[微信接收文件]: ${describePath(filePath)}`);
             }
           }
           // 5: 视频
@@ -314,19 +315,34 @@ async function startPolling() {
 
         if (!text.trim()) {
           console.log('[收到空消息或未支持的媒体类型，暂不处理]');
+          seenIds.add(messageId);
           continue;
         }
 
-        console.log(`\n[微信收到用户指令]: ${text}`);
+        console.log(`\n[微信收到用户指令] ${describeText(text)}（图片 ${imagePaths.length}，文件 ${filePaths.length}）`);
 
-        // 异步转发给 routine「微信下旨入口」，不阻塞后续长轮询
-        forwardToRoutine(webhookUrl, webhookKey, {
+        // 落进收件箱，由 routine 按顺序取走处理；routine 暂时不在线也不会丢
+        enqueueInbox({
+          message_id: messageId,
+          create_time_ms: msg.create_time_ms || Date.now(),
           from_user_id: fromUser,
           message_text: text,
           context_token: msg.context_token,
-        }).catch((fwdErr) => {
-          console.error(`[转发至 Routine 失败]:`, fwdErr.message);
         });
+        seenIds.add(messageId);
+      }
+
+      // 整批消息都已落盘，才推进同步游标；中途崩溃会重新拉到这批，靠 message_id 去重
+      const cursorChanged = Boolean(data.get_updates_buf) && data.get_updates_buf !== getUpdatesBuf;
+      if (msgs.length > 0 || cursorChanged) {
+        const stateUpdates = { recent_message_ids: [...seenIds].slice(-500) };
+        if (data.get_updates_buf) stateUpdates.get_updates_buf = data.get_updates_buf;
+        if (latestContextToken) stateUpdates.last_context_token = latestContextToken;
+        if (latestUserMessageAt) stateUpdates.last_user_message_at = latestUserMessageAt;
+        saveRuntimeState('forwarder', stateUpdates);
+      }
+      if (data.get_updates_buf) {
+        getUpdatesBuf = data.get_updates_buf;
       }
     } catch (err) {
       console.error('[轮询异常中断，3秒后重试]:', err.message);

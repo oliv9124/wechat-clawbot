@@ -1,29 +1,43 @@
+// 定时任务：每个任务到点调用 generateCopy() 生成文案，发给绑定的微信。改完执行 ./start.sh 重新加载。
+//   hour / minute：北京时间；workdaysOnly：只在周一到周五发
+//   memoryDigest: true：这条后面附上"记忆变动"（上次汇报以来记住、改了什么，可以回「撤销记忆 N」撤销）
 import { fetchWeather } from '../../core/weather.js';
-import { callAiCopy } from '../../core/scheduler.js';
-import { stripMarkdown } from '../../core/wechat_reply.js';
+import { callAiCopy } from '../../core/ai_copy.js';
+import { loadConfig } from '../../core/wechat_reply.js';
+
+// 早间天气的城市：改成你所在城市的纬度、经度和名字
+const CITY = { lat: '39.9042', lon: '116.4074', name: '北京' };
+
+const { user_nickname: nick = '主人', bot_name: me = '小助理' } = loadConfig();
+
+// 先让智能体写文案，写不出来（超时、出错）就从预设里挑一条
+async function copy(prompt, fallbacks) {
+  try {
+    const text = await callAiCopy(prompt);
+    if (text) return text;
+  } catch {}
+  return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+}
 
 export const TASKS = [
   {
     id: 'weather_morning',
-    name: '早间天气播报',
+    name: '早间天气',
     hour: 8,
     minute: 30,
     workdaysOnly: false,
+    memoryDigest: true,
     generateCopy: async () => {
-      // 默认城市：北京 (经纬度: 39.9042, 116.4074)。可根据需要自由修改城市与经纬度。
-      const weather = await fetchWeather('39.9042', '116.4074', '北京');
-      const prompt = `你是微信专属助理，请根据实时天气给主人写一条早上8:30的天气播报问候。天气数据：${weather.summary}。要求：俏皮灵动、充满元气，包含穿衣与出行建议，60~90字，直接输出内容。`;
-      try {
-        const aiText = await callAiCopy(prompt);
-        if (aiText) return stripMarkdown(aiText);
-      } catch (e) {
-        console.warn('[AI文案生成超时，使用精选预设]');
-      }
-      const fallbacks = [
-        `🌅 早上好！今日天气播报：${weather.summary} 新的一天元气开启，记得吃顿营养早餐，保持好心情出发！✨`,
-        `叮咚！天气管家已上线～☀️ ${weather.summary} 愿你今天工作顺利，事事舒心，幸运值拉满！🚀`,
-      ];
-      return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+      const weather = await fetchWeather(CITY.lat, CITY.lon, CITY.name);
+      // 拿不到天气就直说，不让智能体照着空数据编
+      if (!weather.success) return `🌅 ${nick}早上好！今天暂时没拿到${CITY.name}的天气数据，出门前看一眼手机天气吧～`;
+      return copy(
+        `你是${nick}的微信助理【${me}】，请根据实时天气写一条早上 8:30 的天气播报问候。天气数据：${weather.summary}。要求：俏皮灵动、充满元气，包含穿衣与出行建议，称呼用户为"${nick}"，60~90 字，直接输出内容。`,
+        [
+          `🌅 ${nick}早上好！今日天气：${weather.summary} 记得吃顿营养早餐，保持好心情出发！✨`,
+          `叮咚！${me}的天气播报来啦～☀️ ${weather.summary} 愿你今天顺顺利利！🚀`,
+        ],
+      );
     },
   },
   {
@@ -31,37 +45,27 @@ export const TASKS = [
     name: '工作日午餐提醒',
     hour: 11,
     minute: 30,
-    workdaysOnly: true, // 仅周一至周五触发
-    generateCopy: async () => {
-      const prompt = `你是微信专属助理，现在是工作日上午11:30，提醒主人该准备吃午餐了。文案幽默、干饭人风格、接地气，40~60字，直接输出。`;
-      try {
-        const aiText = await callAiCopy(prompt);
-        if (aiText) return stripMarkdown(aiText);
-      } catch (e) {}
-      const fallbacks = [
-        '🍱 干饭时间到！上午辛苦啦，赶紧放下手中的工作，去吃顿美味的午餐犒劳一下自己吧！🥢😋',
-        '🔔 叮咚！午餐信号已送达！劳逸结合效率更高，快去享受今天的美食能量补充～🍲✨',
-      ];
-      return fallbacks[Math.floor(Math.random() * fallbacks.length)];
-    },
+    workdaysOnly: true,
+    generateCopy: () => copy(
+      `你是${nick}的微信助理【${me}】，现在是工作日上午 11:30，提醒${nick}该准备吃午餐了。文案幽默、接地气，称呼用户为"${nick}"，40~60 字，直接输出。`,
+      [
+        `🍱 ${nick}，干饭时间到！上午辛苦啦，去吃顿好的犒劳一下自己吧～`,
+        `🔔 午餐信号已送达！劳逸结合效率更高，${nick}快去补充能量～`,
+      ],
+    ),
   },
   {
     id: 'night_rest',
-    name: '晚间早睡关怀',
+    name: '晚间早睡提醒',
     hour: 23,
     minute: 0,
     workdaysOnly: false,
-    generateCopy: async () => {
-      const prompt = `你是微信专属助理，现在是深夜23:00，提醒主人该准备早点休息了。语气温柔贴心治愈，40~60字，直接输出。`;
-      try {
-        const aiText = await callAiCopy(prompt);
-        if (aiText) return stripMarkdown(aiText);
-      } catch (e) {}
-      const fallbacks = [
-        '🌙 夜深啦！今天辛苦了一整天，放下手机，给眼睛和身体放个假吧，晚安好梦～😴🛌',
-        '✨ 叮咚！今日电量已消耗完毕，请及时回充睡眠能源～祝你今晚一夜好眠，明天见！💤🌟',
-      ];
-      return fallbacks[Math.floor(Math.random() * fallbacks.length)];
-    },
+    generateCopy: () => copy(
+      `你是${nick}的微信助理【${me}】，现在是晚上 23:00，提醒${nick}早点休息。语气温柔治愈，称呼用户为"${nick}"，40~60 字，直接输出。`,
+      [
+        `🌙 ${nick}，夜深啦！放下手机，让眼睛和身体休息一下吧，晚安好梦～`,
+        `✨ 今日电量已用完，请及时充电睡觉～祝${nick}一夜好眠，明天见！`,
+      ],
+    ),
   },
 ];

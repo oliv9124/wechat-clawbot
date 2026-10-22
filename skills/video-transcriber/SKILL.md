@@ -16,7 +16,7 @@ description: >-
 ## 一、 核心执行命令
 
 ```bash
-python3 /root/agy/.agents/skills/video-transcriber/scripts/video_transcriber.py "<url_or_filepath>" --output-dir "<downloads_dir>"
+python3 skills/video-transcriber/scripts/video_transcriber.py "<url_or_filepath>" --output-dir "<downloads_dir>"
 ```
 
 ### 参数说明：

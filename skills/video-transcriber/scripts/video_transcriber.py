@@ -163,8 +163,6 @@ def main():
     elif re.search(r'(bilibili\.com|b23\.tv|BV[a-zA-Z0-9]{10})', input_val, re.IGNORECASE):
         # B站专属通道：优先提取字幕或纯音频，默认不下视频大文件
         bili_script = Path(__file__).resolve().parent / "bilibili_extractor.py"
-        if not bili_script.exists():
-            bili_script = Path("/root/agy/scripts/bilibili_extractor.py")
 
         out_dir = resolve_category_dir(args.output_dir, "bilibili")
         cmd = [sys.executable, str(bili_script), input_val, "--output-dir", out_dir]
@@ -178,13 +176,9 @@ def main():
         else:
             result = {'success': False, 'error': f"B站解析异常: {proc.stderr}"}
     else:
-        # 自动探测并适配 playwright_download.py 脚本路径
+        # 下载脚本与本脚本放在同一目录
         candidates = [
             Path(__file__).resolve().parent / "playwright_download.py",
-            Path(__file__).resolve().parent.parent / "skills" / "douyin-downloader" / "scripts" / "playwright_download.py",
-            Path(__file__).resolve().parent.parent / "wechat-clawbot-shareable" / "skills" / "douyin-downloader" / "scripts" / "playwright_download.py",
-            Path("/root/agy/skills/douyin-downloader/scripts/playwright_download.py"),
-            Path("/root/agy/wechat-clawbot-shareable/skills/douyin-downloader/scripts/playwright_download.py"),
         ]
         dl_script = next((c for c in candidates if c.exists()), None)
         if not dl_script:

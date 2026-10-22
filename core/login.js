@@ -1,11 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, saveConfig } from './wechat_reply.js';
+import { getConfigPath, getRuntimeStatePath, saveConfig, saveRuntimeState } from './wechat_reply.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -101,18 +101,43 @@ async function main() {
           bot_token: statusRes.bot_token,
           base_url: statusRes.baseurl || 'https://ilinkai.weixin.qq.com',
           authorized_user_id: statusRes.ilink_user_id || '',
-          get_updates_buf: '',
-          last_context_token: '',
         });
+        // 新凭证对应新的同步进度和上下文，清空 forwarder 的运行时状态
+        saveRuntimeState('forwarder', { get_updates_buf: '', last_context_token: '' });
+        if (!statusRes.ilink_user_id) {
+          console.warn('⚠️ 扫码结果里没有用户 ID：机器人会拒收所有消息，请重新扫码绑定。');
+        }
 
-        console.log('凭证已安全保存至 config.json，正在自动重启后台服务...');
-        try {
-          if (fs.existsSync(path.join(botRoot, 'ecosystem.config.cjs'))) {
-            execSync('pm2 startOrReload ecosystem.config.cjs && pm2 save', { stdio: 'inherit', cwd: botRoot });
-            console.log('✅ 后台服务已自动热加载全新会话与凭证！');
+        // 以 root 运行时，把配置和状态文件交还给实例目录的运行账号（受限账号要能读配置、能写状态）
+        const dataDir = path.join(botRoot, 'data');
+        if (process.getuid && process.getuid() === 0 && fs.existsSync(dataDir)) {
+          const owner = fs.statSync(dataDir);
+          fs.chownSync(getConfigPath(), 0, owner.gid);
+          fs.chmodSync(getConfigPath(), 0o640);
+          fs.chownSync(getRuntimeStatePath('forwarder'), owner.uid, owner.gid);
+        }
+
+        // 让新凭证生效：systemd 托管的重启 3 个服务，PM2 托管的重启 3 个进程，还没启动过就提示怎么启动
+        const bot = path.basename(botRoot);
+        const units = ['routine', 'forwarder', 'scheduler'].map((s) => `clawbot-${s}@${bot}`);
+        const pm2Apps = ['routine', 'forwarder', 'scheduler'].map((s) => `${bot}-${s}`);
+        console.log('凭证已安全保存至 config.json。');
+        if (systemdManaged(units[0])) {
+          try {
+            execFileSync('systemctl', ['restart', ...units], { stdio: 'inherit' });
+            console.log('✅ 后台服务已重启，新凭证已生效！');
+          } catch {
+            console.warn(`[重启提示] 自动重启失败，请手动执行: systemctl restart ${units.join(' ')}`);
           }
-        } catch (pm2Err) {
-          console.warn('[PM2 重启提示]:', pm2Err.message);
+        } else if (pm2Has(pm2Apps[0])) {
+          try {
+            execFileSync('pm2', ['restart', ...pm2Apps], { stdio: 'inherit' });
+            console.log('✅ PM2 进程已重启，新凭证已生效！');
+          } catch {
+            console.warn(`[重启提示] 自动重启失败，请手动执行: pm2 restart ${pm2Apps.join(' ')}`);
+          }
+        } else {
+          console.log('下一步：在本目录执行 ./start.sh 启动机器人。');
         }
         console.log('提示：绑定成功后，请先在手机微信 ClawBot 对话里发送任意一句话（例如“你好”或“1”），以激活新的上下文！');
         return;
@@ -128,6 +153,25 @@ async function main() {
 
   console.error('❌ 扫码超时（5 分钟），请重新获取二维码！');
   process.exit(1);
+}
+
+// 这个机器人用 systemd 托管：服务在运行或已启用（只装了服务模板、实际用 PM2 的不算）
+function systemdManaged(unit) {
+  try {
+    const out = execFileSync('systemctl', ['show', unit, '-p', 'LoadState', '-p', 'ActiveState', '-p', 'UnitFileState'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const kv = Object.fromEntries(out.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+    return kv.LoadState === 'loaded' && (kv.ActiveState !== 'inactive' || (kv.UnitFileState || '').startsWith('enabled'));
+  } catch {
+    return false;
+  }
+}
+
+function pm2Has(name) {
+  try {
+    return JSON.parse(execFileSync('pm2', ['jlist'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] })).some((p) => p.name === name);
+  } catch {
+    return false;
+  }
 }
 
 main().catch((err) => {

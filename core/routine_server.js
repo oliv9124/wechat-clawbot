@@ -2,13 +2,12 @@ process.env.NO_PROXY = '127.0.0.1,localhost';
 process.env.no_proxy = '127.0.0.1,localhost';
 
 import http from 'node:http';
-import { execFile, exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const execAsync = promisify(exec);
 import {
   sendWechatReply,
   sendWechatTyping,
@@ -16,13 +15,33 @@ import {
   uploadAndSendWechatFile,
   uploadAndSendWechatVideo,
   loadConfig,
-  saveConfig,
-  stripMarkdown,
+  loadRuntimeState,
+  saveRuntimeState,
+  describeText,
+  describePath,
 } from './wechat_reply.js';
-import { loadTopicsConfig } from './memory_config.js';
+import {
+  enqueueInbox,
+  listPending,
+  claimInbox,
+  finishInbox,
+  retryOrFailInbox,
+  failInbox,
+  requeueProcessing,
+  messageIdFromFileName,
+} from './inbox.js';
+import { RESET_MARKER, loadTopicsConfig, capForLoading, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS, TOPIC_ALWAYS_BUDGET } from './memory_config.js';
+import { memoryMode, useStandaloneHistory, parseMemoryCommand, findBotByName, showChanges, undoItems } from './memory_history.js';
+import { raiseAlert } from './alert.js';
+import { agentOutcome, recordAgentResult } from './agent_health.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
+// 自己管记忆历史的实例（默认每个实例自己管；统一管理时只有主人的机器人）才处理「记忆改动」「撤销记忆 N」，
+// 被代管的实例照常交给智能体
+const MEMORY_MODE = memoryMode(botRoot);
+if (MEMORY_MODE === 'standalone') useStandaloneHistory(botRoot);
+const MEMORY_REVIEW = MEMORY_MODE === 'owner' || MEMORY_MODE === 'standalone';
 
 // 自动检测监听端口（优先配置项 port -> webhook_url 端口 -> 环境变量 -> 默认 18888）
 function resolvePort() {
@@ -121,12 +140,23 @@ function isDeliverableFile(filePath) {
   return true;
 }
 
-// 检查文件是否安全属于当前 Bot 作用域（只允许本实例目录或 /tmp 临时交付物，杜绝跨号串发）
+// 检查文件是否安全属于当前 Bot 作用域：只允许本实例目录，或 /tmp 里由本进程用户创建的临时交付物，杜绝跨号串发。
+// 先解析软链接，防止用链接指到实例目录以外；前缀比较带上分隔符，避免 bots/bot2 被当成 bots/bot。
 function isPathAllowedForThisBot(p) {
-  const norm = path.normalize(p);
-  if (norm.startsWith('/tmp/')) return true;
-  if (norm.startsWith(botRoot)) return true;
-  return false;
+  let real;
+  try {
+    real = fs.realpathSync(p);
+  } catch {
+    return false;
+  }
+  if (real.startsWith('/tmp/')) {
+    try {
+      return fs.statSync(real).uid === process.getuid();
+    } catch {
+      return false;
+    }
+  }
+  return real.startsWith(botRoot + path.sep);
 }
 
 /**
@@ -157,7 +187,7 @@ function extractMediaPaths(text) {
     }
   }
 
-  const absPathRegex = /(\/(?:root|tmp)[^\s\)\"\'\<\>]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|xlsx|zip|tar\.gz|md|html|htm|mp4|mov|m4v))/gi;
+  const absPathRegex = /(\/(?:srv|root|tmp)[^\s\)\"\'\<\>]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|xlsx|zip|tar\.gz|md|html|htm|mp4|mov|m4v))/gi;
   for (const m of text.matchAll(absPathRegex)) {
     const p = m[1];
     if (!isPathAllowedForThisBot(p)) continue;
@@ -177,7 +207,7 @@ function extractMediaPaths(text) {
   }
 
   // 兼容带空格或被引号/反引号包裹的文件路径
-  const quotedPathRegex = /[`"'](\/(?:root|tmp)[^`"'\r\n]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|xlsx|zip|tar\.gz|md|html|htm|mp4|mov|m4v))[`"']/gi;
+  const quotedPathRegex = /[`"'](\/(?:srv|root|tmp)[^`"'\r\n]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|xlsx|zip|tar\.gz|md|html|htm|mp4|mov|m4v))[`"']/gi;
   for (const m of text.matchAll(quotedPathRegex)) {
     const p = m[1].trim();
     if (!isPathAllowedForThisBot(p)) continue;
@@ -225,7 +255,7 @@ function extractMediaPaths(text) {
             }
           }
           if (latestVideo) {
-            console.log(`[自动兜底捕获到新鲜下载的视频]: ${latestVideo}`);
+            console.log(`[自动兜底捕获到新鲜下载的视频]: ${describePath(latestVideo)}`);
             videos.add(latestVideo);
             break;
           }
@@ -245,6 +275,9 @@ function extractMediaPaths(text) {
  * Run Antigravity CLI (agy) to process user prompt and generate an answer.
  * Seamlessly supports multi-turn conversation memory with --conversation <id>.
  */
+// 正在运行的 agy 进程数（含转入后台的任务），用来限制同时跑的智能体数量
+let activeAgents = 0;
+
 function runAgent(promptText, conversationId = null) {
   return new Promise((resolve, reject) => {
     const args = ['--dangerously-skip-permissions'];
@@ -255,6 +288,7 @@ function runAgent(promptText, conversationId = null) {
 
     console.log(`[调用 agy]: 会话ID=${conversationId || '(全新会话)'}`);
 
+    activeAgents++;
     execFile(
       'agy',
       args,
@@ -265,28 +299,34 @@ function runAgent(promptText, conversationId = null) {
         maxBuffer: 20 * 1024 * 1024,
       },
       (error, stdout, stderr) => {
-        if (error) {
-          const isTimeout = error.killed || error.signal === 'SIGTERM';
-          if (conversationId && !isTimeout) {
+        activeAgents--;
+        // 退出码为 0 但输出里 status 是 ERROR 的也算失败（比如登录失效）
+        const outcome = agentOutcome(error, stdout, stderr);
+        if (!outcome.ok) {
+          // 会话本身接不上才值得换新会话重试；登录失效、超时，重试也一样失败，只会让用户多等
+          if (conversationId && outcome.kind === 'error') {
             console.warn(`[agy] 会话 ${conversationId} 恢复失败，自动创建全新会话重试...`);
-            return runAgent(promptText, null).then(resolve).catch(reject);
+            // 标记 resumeFailed，回复里会告诉用户"原来的会话没接上"
+            return runAgent(promptText, null)
+              .then((res) => resolve({ ...res, resumeFailed: true }))
+              .catch(reject);
           }
-          console.error('[agy exec error]:', error, stderr);
-          return reject(new Error(`Agent processing failed: ${stderr || error.message}`));
+          recordAgentResult('routine', outcome);
+          // error.message 里带着完整命令行（也就是整段 prompt），日志和报错都只用退出码和错误输出的末尾
+          const detail = outcome.kind === 'auth'
+            ? outcome.reason
+            : String(stderr || '').trim().slice(-300) || `exit ${error?.code ?? error?.signal ?? 'status ERROR'}`;
+          console.error(`[agy exec error]: code=${error?.code ?? '-'} signal=${error?.signal ?? '-'} ${detail}`);
+          const err = new Error(`Agent processing failed: ${detail}`);
+          err.agentFailure = outcome.kind;
+          return reject(err);
         }
 
-        try {
-          const res = JSON.parse(stdout.trim());
-          resolve({
-            reply: res.response || '',
-            conversationId: res.conversation_id || conversationId,
-          });
-        } catch {
-          resolve({
-            reply: stdout.trim(),
-            conversationId: conversationId,
-          });
-        }
+        recordAgentResult('routine', outcome);
+        if (outcome.warning) console.warn(`[agy 提示] 有回复，但带着提示（照常使用回复）：${outcome.warning}`);
+        resolve(outcome.json
+          ? { reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId }
+          : { reply: stdout.trim(), conversationId });
       }
     );
   });
@@ -339,15 +379,30 @@ const pushRateLimiter = new PushRateLimiter();
 // 活跃后台任务集合（存储 key: "userId:messageText"），实现防重与幂等
 const activeBackgroundTasks = new Set();
 
-const messageQueue = [];
-let isProcessingQueue = false;
+// 同时最多运行的智能体数量（含转入后台的任务），超出的消息留在收件箱里排队
+const MAX_ACTIVE_AGENTS = 2;
+// 超过这个时间还没出结果，先回一句"转入后台"，任务继续在后台跑（环境变量仅供测试缩短）。
+// 原来是 35 秒：实测一条消息中位数就要 48 秒，七成消息都会先收到这句；改成 90 秒后大约一成多
+const SOFT_TIMEOUT_MS = Number(process.env.ROUTINE_SOFT_TIMEOUT_MS) || 90000;
+// 等结果期间每隔多久重发一次"正在输入"，免得对方以为没反应（环境变量仅供测试）
+const TYPING_REFRESH_MS = Number(process.env.ROUTINE_TYPING_REFRESH_MS) || 20000;
+
+// 会话占用锁：主会话被转入后台的任务占着时，新消息改用临时会话，避免两个 agy 同时写同一个会话
+let mainConversationBusy = false;
+// 每次"重置会话"加一；后台任务结束时只有代数没变才回写会话 ID，不会把重置覆盖掉
+let mainConversationGeneration = 0;
+
+const CONVERSATION_LOST_NOTICE = '（提示：原来的会话没能接上，已经开了一个新会话，之前聊过的细节可能记不全了。）';
+// 智能体登录失效时回给用户的话（监控会同时通知主人去重新登录）
+const agentLoginNotice = (botName) => `${botName}这会儿连不上智能体（登录失效了），已经通知去处理了，稍后再试哦～`;
 
 /**
  * 聚合交付下发引擎：将文本回复与附带媒体（图片/原生视频卡片/文件）安全推送到微信
  */
 async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgentReply, isAsyncCallback = false) {
   const config = loadConfig();
-  const plainReply = stripMarkdown(textReply);
+  // 去 Markdown 统一在 sendWechatReply 里做一次；这里再做一遍会伤到已经去掉反引号的代码内容
+  const plainReply = textReply;
 
   if (isAsyncCallback) {
     // 异步回调受防封流控保护
@@ -361,6 +416,7 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
     appendLog(`AI回复(${isAsyncCallback ? '后台回调' : '实时'}): ${plainReply}`);
   } catch (replyErr) {
     console.error(`[回复微信文本失败]:`, replyErr.message);
+    raiseAlert('reply_failed', `一条回复没发出去：${replyErr.message}`);
   }
 
   // 2. 检查是否有新鲜生成的媒体 (图片 / 视频 / 文件)
@@ -371,9 +427,9 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
     const latestImg = media.images[media.images.length - 1];
     try {
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
-      console.log(`[正在上传并发送图片至微信]: ${latestImg}`);
+      console.log(`[正在上传并发送图片至微信]: ${describePath(latestImg)}`);
       await uploadAndSendWechatImage(toUserId, contextToken, latestImg, config);
-      console.log(`[已成功将图片卡片发送至微信]: ${latestImg}`);
+      console.log(`[已成功将图片卡片发送至微信]: ${describePath(latestImg)}`);
     } catch (imgErr) {
       console.error(`[发送微信图片卡片失败]:`, imgErr.message);
     }
@@ -384,9 +440,9 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
     const latestVideo = media.videos[media.videos.length - 1];
     try {
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
-      console.log(`[正在上传并发送原生视频卡片至微信]: ${latestVideo}`);
+      console.log(`[正在上传并发送原生视频卡片至微信]: ${describePath(latestVideo)}`);
       await uploadAndSendWechatVideo(toUserId, contextToken, latestVideo, config);
-      console.log(`[已成功将原生视频卡片发送至微信]: ${latestVideo}`);
+      console.log(`[已成功将原生视频卡片发送至微信]: ${describePath(latestVideo)}`);
     } catch (vidErr) {
       console.error(`[发送微信原生视频卡片失败]:`, vidErr.message);
     }
@@ -397,9 +453,9 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
     const latestFile = media.files[media.files.length - 1];
     try {
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
-      console.log(`[正在上传并发送文件至微信]: ${latestFile}`);
+      console.log(`[正在上传并发送文件至微信]: ${describePath(latestFile)}`);
       await uploadAndSendWechatFile(toUserId, contextToken, latestFile, config);
-      console.log(`[已成功将文件发送至微信]: ${latestFile}`);
+      console.log(`[已成功将文件发送至微信]: ${describePath(latestFile)}`);
     } catch (fileErr) {
       console.error(`[发送微信文件失败]:`, fileErr.message);
     }
@@ -407,108 +463,11 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
 }
 
 /**
- * 微信端一键空中升级 (OTA Air-Upgrade)
- * 支持指令：更新系统 / 系统更新 / 升级系统 / 检查更新 / /upgrade / /update
- */
-async function handleSystemUpgradeTask({ from_user_id, context_token, config }) {
-  const userNickname = config.user_nickname || '主人';
-
-  // 1. 权限拦截：仅限当前实例授权绑定的主人操作
-  if (config.authorized_user_id && from_user_id !== config.authorized_user_id) {
-    console.log(`[升级拦截]: 非授权微信用户尝试触发升级: ${from_user_id}`);
-    const unauthorizedNotice = `抱歉，只有【${userNickname}】才能执行系统空中升级指令哦～`;
-    if (from_user_id && context_token) {
-      await sendWechatReply(from_user_id, context_token, unauthorizedNotice, config);
-    }
-    return;
-  }
-
-  // 2. 检查 Git 仓库环境
-  const repoRoot = path.resolve(__dirname, '..');
-  const gitDir = path.join(repoRoot, '.git');
-  if (!fs.existsSync(gitDir)) {
-    console.warn(`[升级拦截]: 当前目录未检测到 .git 仓库: ${repoRoot}`);
-    const noGitNotice = `⚠️ 【无法空中升级】\n当前运行环境未检测到 Git 仓库版本管理。\n若为源码部署，请确认是否通过 git clone 获取完整工程。`;
-    if (from_user_id && context_token) {
-      await sendWechatReply(from_user_id, context_token, noGitNotice, config);
-    }
-    return;
-  }
-
-  // 3. 秒级回执接单提示
-  const startNotice = `🔄 【空中升级进行中】\n${userNickname}，正在连接云端拉取最新系统核心与技能代码，请稍候...`;
-  if (from_user_id && context_token) {
-    try {
-      await sendWechatReply(from_user_id, context_token, startNotice, config);
-      await sendWechatTyping(from_user_id, context_token, 1, config);
-    } catch (e) {
-      console.warn(`[发送升级接单提示异常]:`, e.message);
-    }
-  }
-
-  // 4. 执行 git pull
-  try {
-    const { stdout } = await execAsync('git pull', { cwd: repoRoot, timeout: 60000 });
-    console.log(`[Git Pull 结果]:`, stdout);
-
-    if (stdout.includes('Already up to date') || stdout.includes('已经是最新')) {
-      let commitInfo = '';
-      try {
-        const { stdout: logOut } = await execAsync('git log -1 --pretty=format:"%h - %s (%cr)"', { cwd: repoRoot });
-        commitInfo = `\n📌 当前版本: ${logOut.trim()}`;
-      } catch {}
-      const alreadyLatestNotice = `✅ 【系统已是最新版本】\n${userNickname}，当前机器人系统已与云端代码完全同步，无需重复更新！${commitInfo}`;
-      if (from_user_id && context_token) {
-        await sendWechatReply(from_user_id, context_token, alreadyLatestNotice, config);
-        await sendWechatTyping(from_user_id, context_token, 2, config);
-      }
-      return;
-    }
-
-    // 成功拉取到新更新
-    let latestCommit = '';
-    try {
-      const { stdout: logOut } = await execAsync('git log -1 --pretty=format:"%h - %s (%cr)"', { cwd: repoRoot });
-      latestCommit = logOut.trim();
-    } catch {}
-
-    const successNotice = `🎉 【系统空中升级成功】\n${userNickname}，已成功从云端拉取最新工程代码！\n\n📌 最新版本: ${latestCommit}\n\n⚙️ 正在为您平滑热重载后台服务，请稍候 3 秒...`;
-    if (from_user_id && context_token) {
-      await sendWechatReply(from_user_id, context_token, successNotice, config);
-      await sendWechatTyping(from_user_id, context_token, 2, config);
-    }
-
-    // 延迟 2 秒执行平滑热重载，确保回复已安全下发到微信
-    setTimeout(async () => {
-      try {
-        const ecoFile = path.join(botRoot, 'ecosystem.config.cjs');
-        const reloadCmd = fs.existsSync(ecoFile)
-          ? `pm2 startOrReload "${ecoFile}" && pm2 save`
-          : `pm2 reload all`;
-        console.log(`[执行服务热重载]: ${reloadCmd}`);
-        await execAsync(reloadCmd, { cwd: botRoot });
-        console.log(`[服务热重载完成]`);
-      } catch (reloadErr) {
-        console.error(`[服务热重载异常]:`, reloadErr.message);
-      }
-    }, 2000);
-
-  } catch (err) {
-    console.error(`[空中升级异常]:`, err);
-    const failReason = (err.stderr || err.message || '网络连接超时').slice(0, 300);
-    const failNotice = `⚠️ 【系统空中升级失败】\n拉取云端更新时遇到异常：\n${failReason}\n\n请稍候重试或检查服务器 Git 状态。`;
-    if (from_user_id && context_token) {
-      await sendWechatReply(from_user_id, context_token, failNotice, config);
-      await sendWechatTyping(from_user_id, context_token, 2, config);
-    }
-  }
-}
-
-/**
- * 从单个日志文件中提取有效对话轮次
+ * 从单个日志文件中提取有效对话轮次（从新往旧读）。
+ * 读到"会话已重置"标记就停：用户清除过记忆，更早的对话一律不再带入。返回 { turns, hitReset }。
  */
 function parseTurnsFromLog(filePath, maxTurns = 10) {
-  if (!fs.existsSync(filePath)) return [];
+  if (!fs.existsSync(filePath)) return { turns: [], hitReset: false };
   try {
     const raw = fs.readFileSync(filePath, 'utf-8');
     const lines = raw.split(/\n(?=\[\d{4}-\d{2}-\d{2}T)/);
@@ -518,7 +477,10 @@ function parseTurnsFromLog(filePath, maxTurns = 10) {
       const block = lines[i].trim();
       if (!block) continue;
 
-      if (block.includes('[后台接管预告]') || block.includes('[会话已重置]')) {
+      if (block.includes(RESET_MARKER)) {
+        return { turns: parsedTurns, hitReset: true };
+      }
+      if (block.includes('[后台接管预告]')) {
         continue;
       }
 
@@ -541,14 +503,14 @@ function parseTurnsFromLog(filePath, maxTurns = 10) {
         continue;
       }
     }
-    return parsedTurns;
+    return { turns: parsedTurns, hitReset: false };
   } catch {
-    return [];
+    return { turns: [], hitReset: false };
   }
 }
 
 /**
- * 提取最近几轮真实对话上下文 (跨天无缝缝合滑窗防失忆护栏)
+ * 提取最近几轮真实对话上下文 (跨天无缝缝合滑窗防失忆护栏)；遇到"会话已重置"标记就不再往前读
  */
 function getRecentChatContext(maxRounds = 5) {
   const neededTurns = maxRounds * 2;
@@ -556,18 +518,20 @@ function getRecentChatContext(maxRounds = 5) {
   const yesterdayFile = getDailyLogPath(-1);
 
   // 1. 优先读取今天的切片日志
-  let turns = parseTurnsFromLog(todayFile, neededTurns);
+  const today = parseTurnsFromLog(todayFile, neededTurns);
+  let turns = today.turns;
+  let hitReset = today.hitReset;
 
   // 2. 如果今天刚过零点对话较少，向前无缝补齐昨天的对话记录
-  if (turns.length < neededTurns && fs.existsSync(yesterdayFile)) {
-    const remaining = neededTurns - turns.length;
-    const yesterdayTurns = parseTurnsFromLog(yesterdayFile, remaining);
-    turns = [...yesterdayTurns, ...turns];
+  if (!hitReset && turns.length < neededTurns && fs.existsSync(yesterdayFile)) {
+    const yesterday = parseTurnsFromLog(yesterdayFile, neededTurns - turns.length);
+    turns = [...yesterday.turns, ...turns];
+    hitReset = yesterday.hitReset;
   }
 
   // 3. 向下兼容：如果按天切片尚未沉淀，保底读取旧单文件
-  if (turns.length === 0 && fs.existsSync(LOG_FILE)) {
-    turns = parseTurnsFromLog(LOG_FILE, neededTurns);
+  if (!hitReset && turns.length === 0 && fs.existsSync(LOG_FILE)) {
+    turns = parseTurnsFromLog(LOG_FILE, neededTurns).turns;
   }
 
   if (turns.length > 0) {
@@ -585,49 +549,73 @@ function matchesKeyword(text, keyword) {
   return text.includes(k);
 }
 
-/**
- * 动态加载当前 Bot 的专属专题知识分卷 (命中关键词才挂载，平时 0 消耗)。
- * 专题和关键词写在各实例自己的 topics.json 里（参考 bots/starter-bot/topics.example.json）。
- */
-function loadTopicMemory(messageText) {
-  const topicsDir = path.join(botRoot, 'data', 'memory', 'topics');
-  const text = (messageText || '').toLowerCase();
-  const matchedSections = [];
-
-  for (const topic of loadTopicsConfig(botRoot)) {
-    if (!topic.keywords.some((k) => matchesKeyword(text, k))) continue;
-    try {
-      const content = fs.readFileSync(path.join(topicsDir, topic.file), 'utf-8').trim();
-      if (content) matchedSections.push(`【${topic.name} (${topic.file})】：\n${content}`);
-    } catch {}
+// 之前几条用户消息（不含正在处理的这一条）；遇到"会话已重置"就不再往前找
+function recentUserTexts(count, currentText) {
+  const today = parseTurnsFromLog(getDailyLogPath(0), 30);
+  let turns = today.turns;
+  if (!today.hitReset && turns.filter((t) => t.role === '用户').length <= count) {
+    turns = [...parseTurnsFromLog(getDailyLogPath(-1), 30).turns, ...turns];
   }
-
-  if (matchedSections.length > 0) {
-    return '\n\n' + matchedSections.join('\n\n') + '\n';
-  }
-  return '';
+  const users = turns.filter((t) => t.role === '用户').map((t) => t.text);
+  if (users.length && users[users.length - 1] === String(currentText || '').trim()) users.pop();
+  return users.slice(-count);
 }
 
 /**
- * 读取当前 Bot 专属的核心档案 (MEMORY.md) + 动态按需专题库
+ * 加载当前 Bot 的专题分卷：小专题每条消息都带（从小到大放，合计不超过 TOPIC_ALWAYS_BUDGET 字）；
+ * 放不下的大专题，这条消息或之前两条用户消息里提到关键词才带，聊着聊着不会突然丢掉。
+ * 专题和关键词写在各实例自己的 topics.json 里，核心代码不写死任何个人信息。
+ */
+function loadTopicMemory(messageText) {
+  const topicsDir = path.join(botRoot, 'data', 'memory', 'topics');
+  const topics = [];
+  for (const topic of loadTopicsConfig(botRoot)) {
+    try {
+      const content = fs.readFileSync(path.join(topicsDir, topic.file), 'utf-8').trim();
+      if (content) topics.push({ ...topic, content, size: [...content].length });
+    } catch {}
+  }
+  if (!topics.length) return '';
+
+  const always = new Set();
+  let used = 0;
+  for (const t of [...topics].sort((a, b) => a.size - b.size)) {
+    if (used + t.size > TOPIC_ALWAYS_BUDGET) break;
+    always.add(t.file);
+    used += t.size;
+  }
+  const text = [messageText || '', ...recentUserTexts(2, messageText)].join('\n').toLowerCase();
+  const sections = topics
+    .filter((t) => always.has(t.file) || t.keywords.some((k) => matchesKeyword(text, k)))
+    .map((t) => {
+      const { text: content, truncated } = capForLoading(t.content, TOPIC_MAX_CHARS);
+      if (truncated) console.warn(`[专题分卷] ${t.file} 超过上限太多，这次只带了前 ${TOPIC_MAX_CHARS * 2} 字`);
+      return `【${t.name} (${t.file})】：\n${content}`;
+    });
+  return sections.length ? `\n\n${sections.join('\n\n')}\n` : '';
+}
+
+/**
+ * 读取当前 Bot 专属的核心档案 (MEMORY.md) + 专题分卷
  */
 function loadBotMemory(messageText = '') {
   let result = '';
-  // 1. 核心常驻档案 (严格保持在 3KB 以内，仅包含人设、禁忌、称呼、核心准则)
+  // 1. 核心常驻档案（人设、禁忌、称呼、核心准则）：超过上限照常全部带上，超过两倍才截断
   const memoryPath = path.join(botRoot, 'MEMORY.md');
   if (fs.existsSync(memoryPath)) {
     try {
       const content = fs.readFileSync(memoryPath, 'utf-8').trim();
       if (content) {
-        const safeContent = content.length > 4000 ? content.slice(0, 4000) + '\n...(部分超长历史已沉淀至 data/memory/)' : content;
-        result += `\n\n【核心记忆档案与人设 (MEMORY.md)】：\n${safeContent}\n`;
+        const { text, truncated } = capForLoading(content, MEMORY_MAX_CHARS);
+        if (truncated) console.warn(`[MEMORY.md] 超过上限太多，这次只带了前 ${MEMORY_MAX_CHARS * 2} 字`);
+        result += `\n\n【核心记忆档案与人设 (MEMORY.md)】：\n${text}\n`;
       }
     } catch (e) {
       console.warn('[读取 MEMORY.md 异常]:', e.message);
     }
   }
 
-  // 2. 动态激活匹配的专题分卷（命中关键词才带入，平时不加载，极度节省 token）
+  // 2. 专题分卷：小的常驻，大的按关键词（这条消息和之前两条）
   const topicContent = loadTopicMemory(messageText);
   if (topicContent) {
     result += topicContent;
@@ -636,34 +624,78 @@ function loadBotMemory(messageText = '') {
   return result;
 }
 
+/**
+ * 处理一条消息。返回 null 表示已处理完；任务转入后台时返回 { background }，background 在后台结束时 resolve。
+ * （不能直接返回 Promise：async 函数会自动等它完成，调用方就被卡到后台任务结束。）
+ */
 async function handleWechatTask(task) {
   const { from_user_id, message_text, context_token } = task;
   const config = loadConfig();
 
+  // 第二道防线：forwarder 已经过滤过，这里再确认一次，防止有人绕过 forwarder 直接调用本地 webhook
+  if (!config.authorized_user_id || from_user_id !== config.authorized_user_id) {
+    console.warn(`[拒绝处理] 消息不是来自本实例绑定的授权用户 (${from_user_id || '未知'})，已忽略。`);
+    return null;
+  }
+
   console.log(`\n================== [微信消息开始处理] ==================`);
   console.log(`用户ID: ${from_user_id}`);
-  console.log(`消息内容: ${message_text}`);
+  console.log(`消息内容: ${describeText(message_text)}`);
   appendLog(`微信接收 (${from_user_id}): ${message_text}`);
 
   // 快捷重置会话指令判断
   const isResetCommand = /^\s*(\/reset|\/clear|\/new|新会话|重置会话|清除记忆)\s*$/i.test(message_text);
   if (isResetCommand) {
-    saveConfig({ conversation_id: null });
-    const resetNotice = '已为您开启全新会话，之前的对话记忆已清空。您可以随时提出新任务！';
+    mainConversationGeneration++;
+    saveRuntimeState('routine', { conversation_id: null });
+    // 写进聊天日志：之后组装最近对话、凌晨整理记忆都只看这个标记之后的内容
+    appendLog(RESET_MARKER);
+    const resetNotice = '已开启全新对话：之前的聊天上下文已经清空。长期记忆档案仍然保留，如果要删掉某条长期记忆，直接告诉我就好。';
     if (from_user_id && context_token) {
       await sendWechatReply(from_user_id, context_token, resetNotice, config);
     }
     console.log(`[会话已重置] 用户请求清除上下文。`);
     console.log(`====================================================\n`);
-    return;
+    return null;
   }
 
-  // 系统空中升级指令判断 (OTA Air-Upgrade)
+  // 微信一键升级已关闭：代码更新改在服务器上进行（git + systemctl restart），这里只回一句说明
   const isUpgradeCommand = /^\s*(\/upgrade|\/update|更新系统|系统更新|升级系统|检查更新|更新机器人|升级机器人|机器人更新)\s*$/i.test(message_text);
   if (isUpgradeCommand) {
-    await handleSystemUpgradeTask({ from_user_id, context_token, config });
+    const upgradeNotice = '⚙️ 微信里的一键升级已经关闭。需要更新时，请在服务器上更新代码后重启服务。';
+    if (from_user_id && context_token) {
+      await sendWechatReply(from_user_id, context_token, upgradeNotice, config);
+    }
+    console.log(`[升级指令] 微信一键升级已关闭，已提示用户。`);
     console.log(`====================================================\n`);
-    return;
+    return null;
+  }
+
+  // 主人的记忆命令：程序直接处理，不经过智能体；回复里有记忆内容，不写进聊天日志（免得被整理进机器人自己的记忆）。
+  // 「记忆改动」看自己的；统一管理时主人还能用「X记忆改动」看实例 X 的——名字对不上任何机器人，就当普通消息交给智能体
+  const botsDir = path.dirname(botRoot);
+  let memoryCommand = MEMORY_REVIEW ? parseMemoryCommand(message_text) : null;
+  let showBot = null;
+  if (memoryCommand?.type === 'show') {
+    showBot = memoryCommand.name ? findBotByName(memoryCommand.name, { botsDir }) : path.basename(botRoot);
+    if (!showBot) memoryCommand = null;
+  }
+  if (memoryCommand) {
+    let reply;
+    try {
+      reply = memoryCommand.type === 'show'
+        ? showChanges({ botsDir, bot: showBot })
+        : undoItems(memoryCommand.items, { botsDir });
+      console.log(`[记忆命令] ${memoryCommand.type === 'show' ? '查看改动' : '撤销'}：已处理`);
+    } catch (err) {
+      console.error('[记忆命令失败]:', err.message);
+      reply = '这条记忆命令没有执行成功，原因记在日志里了，稍后再试一次。';
+    }
+    if (from_user_id && context_token) {
+      await sendWechatReply(from_user_id, context_token, reply, config);
+    }
+    console.log(`====================================================\n`);
+    return null;
   }
 
   const userNickname = config.user_nickname || '主人';
@@ -673,15 +705,17 @@ async function handleWechatTask(task) {
 
   // 幂等防重检查：如果同一个任务正在后台运行，直接温和提示，不重复启动
   const taskKey = `${from_user_id}:${message_text.trim()}`;
+  // 日志里用短哈希指代任务，不记消息原文
+  const taskLabel = `任务#${crypto.createHash('sha1').update(taskKey).digest('hex').slice(0, 8)}`;
   if (activeBackgroundTasks.has(taskKey)) {
-    console.log(`[防重幂等拦截]: 任务正在后台运行中，跳过重复拉起: ${taskKey}`);
+    console.log(`[防重幂等拦截]: 任务正在后台运行中，跳过重复拉起: ${taskLabel}`);
     const dupNotice = `${userNickname}，该任务已经在后台全力运转中啦，请稍候片刻，处理完成后【${botName}】会第一时间主动发给您～`;
     if (from_user_id && context_token) {
       await sendWechatReply(from_user_id, context_token, dupNotice, config);
       await sendWechatTyping(from_user_id, context_token, 2, config);
     }
     console.log(`====================================================\n`);
-    return;
+    return null;
   }
 
   // 1. 发送输入中状态
@@ -691,10 +725,26 @@ async function handleWechatTask(task) {
 
   // 2. 调用 Antigravity 生成回复（带多轮会话记忆、长期记忆库与最近对话滑窗护栏）
   console.log(`[Antigravity 思考中...]`);
-  let currentConvId = config.conversation_id || null;
+  // 会话占用锁：主会话空闲就用主会话；正被转入后台的任务占着时，改用临时会话，结果也不回写主会话 ID
+  const useMainConversation = !mainConversationBusy;
+  const generation = mainConversationGeneration;
+  const currentConvId = useMainConversation ? loadRuntimeState('routine').conversation_id || null : null;
+  if (!useMainConversation) {
+    console.log('[会话占用] 主会话正被后台任务使用，本条消息改用临时会话处理。');
+  }
+  const rememberConversation = (res) => {
+    if (!useMainConversation || !res.conversationId || res.conversationId === currentConvId) return;
+    if (generation !== mainConversationGeneration) {
+      console.log('[会话已重置] 任务期间用户重置了会话，不再回写这次的会话 ID。');
+      return;
+    }
+    saveRuntimeState('routine', { conversation_id: res.conversationId });
+    console.log(`[已持久化会话记忆 ID]: ${res.conversationId}`);
+  };
+  const withConversationNotice = (res, text) => (res.resumeFailed ? `${text}\n\n${CONVERSATION_LOST_NOTICE}` : text);
   const memorySection = loadBotMemory(message_text);
   const recentChatSection = getRecentChatContext(5);
-  const fullMessage = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住长期偏好、习惯或专业知识，请主动更新沉淀到当前目录的 MEMORY.md 或 data/memory/topics/ 对应专题分卷中。]${memorySection}${recentChatSection}\n[微信用户 ${userNickname}]: ${message_text}`;
+  const fullMessage = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住长期偏好、习惯或专业知识，请主动更新沉淀到当前目录的 MEMORY.md 或 data/memory/topics/ 对应专题分卷中（MEMORY.md 不超过 ${MEMORY_MAX_CHARS} 字，每个专题分卷不超过 ${TOPIC_MAX_CHARS} 字，写之前先看有没有重复的条目）。]${memorySection}${recentChatSection}\n[微信用户 ${userNickname}]: ${message_text}`;
 
   // 标记活跃后台任务
   activeBackgroundTasks.add(taskKey);
@@ -702,8 +752,7 @@ async function handleWechatTask(task) {
   // 启动智能体执行 (10分钟超时保护)
   const agentPromise = runAgent(fullMessage, currentConvId);
 
-  // 软超时定时器 (35秒)：若 35 秒内未能完成，无缝切入后台静默运行并回执第 1 条接单消息
-  const SOFT_TIMEOUT_MS = 35000;
+  // 软超时定时器：SOFT_TIMEOUT_MS 内没完成，就切入后台运行并先回一句"转入后台"
   let softTimer = null;
   const softTimeoutPromise = new Promise((resolve) => {
     softTimer = setTimeout(() => {
@@ -711,14 +760,23 @@ async function handleWechatTask(task) {
     }, SOFT_TIMEOUT_MS);
   });
 
+  // 等结果期间定时重发"正在输入"；结束时等最后一次发完，免得它落在"停止输入"之后又亮起来
+  let typingInFlight = Promise.resolve();
+  const typingTimer = from_user_id && context_token
+    ? setInterval(() => { typingInFlight = sendWechatTyping(from_user_id, context_token, 1, config, { quiet: true }); }, TYPING_REFRESH_MS)
+    : null;
+
   const raceResult = await Promise.race([
     agentPromise.then((res) => ({ isSlowTask: false, res })).catch((err) => ({ isSlowTask: false, err })),
     softTimeoutPromise,
   ]);
+  if (typingTimer) clearInterval(typingTimer);
+  await typingInFlight;
 
+  let backgroundDone = null;
   if (!raceResult.isSlowTask) {
     // -------------------------------------------------------------
-    // 场景 A: 快速任务（35 秒内完成）- 保持原汁原味单条极速回复
+    // 场景 A: 快速任务（SOFT_TIMEOUT_MS 内完成）- 直接回复一条
     // -------------------------------------------------------------
     clearTimeout(softTimer);
     activeBackgroundTasks.delete(taskKey);
@@ -727,21 +785,24 @@ async function handleWechatTask(task) {
     let rawReply = '';
     if (raceResult.err) {
       console.error('[runAgent 异常]:', raceResult.err.message);
-      plainReply = '小助理刚才正在处理上一条重度任务或网络发生波动，未能及时响应，请稍候重试一下～';
+      // 登录失效时如实说明（监控已经通知主人），不再说成"网络波动"
+      plainReply = raceResult.err.agentFailure === 'auth'
+        ? agentLoginNotice(botName)
+        : '小助理刚才正在处理上一条重度任务或网络发生波动，未能及时响应，请稍候重试一下～';
     } else {
       rawReply = raceResult.res.reply;
       plainReply = rawReply;
-      if (raceResult.res.conversationId && raceResult.res.conversationId !== currentConvId) {
-        saveConfig({ conversation_id: raceResult.res.conversationId });
-        console.log(`[已持久化会话记忆 ID]: ${raceResult.res.conversationId}`);
-      }
+      rememberConversation(raceResult.res);
     }
 
     if (!plainReply || !plainReply.trim()) {
       plainReply = '收到你的消息了，正在处理中。';
     }
+    if (raceResult.res) {
+      plainReply = withConversationNotice(raceResult.res, plainReply);
+    }
 
-    console.log(`[Antigravity 回复]:\n${plainReply}`);
+    console.log(`[Antigravity 回复]: ${describeText(plainReply)}`);
 
     if (from_user_id && context_token) {
       await deliverResultToWechat(from_user_id, context_token, plainReply, rawReply, false);
@@ -749,12 +810,15 @@ async function handleWechatTask(task) {
     }
   } else {
     // -------------------------------------------------------------
-    // 场景 B: 重度长任务（超过 35 秒）- 两段式优雅转入后台
+    // 场景 B: 重度长任务（超过 SOFT_TIMEOUT_MS）- 两段式转入后台
     // -------------------------------------------------------------
-    console.log(`⏳ [任务处理中 (>35s)，转入后台异步托管]: ${taskKey}`);
+    console.log(`⏳ [任务处理中 (>${SOFT_TIMEOUT_MS / 1000}s)，转入后台异步托管]: ${taskLabel}`);
+    if (useMainConversation) {
+      mainConversationBusy = true;
+    }
 
     // 【第 1 段消息】：使用当前新鲜有效的 context_token 秒级接单预告
-    const handoverNotice = `${userNickname}，当前任务计算量较大（正在后台深度处理中），为避免微信等待超时，已自动转入【后台静默运行】。稍后处理完毕【${botName}】会自动把最终结果推送给您，${userNickname}可以先忙别的～`;
+    const handoverNotice = `${userNickname}，这个要多花点时间，${botName}在后台接着弄，好了马上发你～`;
     if (from_user_id && context_token) {
       try {
         await sendWechatReply(from_user_id, context_token, handoverNotice, config);
@@ -767,23 +831,20 @@ async function handleWechatTask(task) {
     }
 
     // 后台继续监听执行结果，彻底释放当前消息队列 handleWechatTask，后续进线消息不再被阻塞！
-    agentPromise
+    backgroundDone = agentPromise
       .then(async (agentRes) => {
         try {
-          console.log(`\n🎉 [后台长任务执行成功]: ${taskKey}`);
+          console.log(`\n🎉 [后台长任务执行成功]: ${taskLabel}`);
           const rawReply = agentRes.reply;
-          if (agentRes.conversationId && agentRes.conversationId !== currentConvId) {
-            saveConfig({ conversation_id: agentRes.conversationId });
-            console.log(`[后台长任务已更新会话记忆 ID]: ${agentRes.conversationId}`);
-          }
+          rememberConversation(agentRes);
 
           const latestConfig = loadConfig();
           const toUser = latestConfig.authorized_user_id || from_user_id;
-          const targetToken = latestConfig.last_context_token || context_token;
+          const targetToken = loadRuntimeState('forwarder').last_context_token || context_token;
 
           // 【第 2 段消息】：终结结果推送，单任务一生仅发这最后一条，杜绝任何碎片骚扰
           const headerPrefix = `🔔 【后台任务完成通知】\n${userNickname}，您交办的长任务已全部处理完成：\n\n`;
-          const finalReply = headerPrefix + rawReply;
+          const finalReply = headerPrefix + withConversationNotice(agentRes, rawReply);
 
           await deliverResultToWechat(toUser, targetToken, finalReply, rawReply, true);
           console.log(`✅ [后台长任务结果已成功推送至微信 (第 2 条消息)]\n`);
@@ -795,43 +856,113 @@ async function handleWechatTask(task) {
       })
       .catch(async (execErr) => {
         try {
-          console.error(`❌ [后台长任务执行异常]: ${taskKey}`, execErr.message);
+          console.error(`❌ [后台长任务执行异常]: ${taskLabel}`, execErr.message);
           const latestConfig = loadConfig();
           const toUser = latestConfig.authorized_user_id || from_user_id;
-          const targetToken = latestConfig.last_context_token || context_token;
+          const targetToken = loadRuntimeState('forwarder').last_context_token || context_token;
 
           let friendlyReason = execErr.message || '未知异常';
           if (friendlyReason.includes('timeout') || friendlyReason.includes('SIGTERM')) {
             friendlyReason = '执行耗时超过系统最大保护上限 (10分钟)';
           }
 
-          const errorNotice = `🔔 【后台任务执行提醒】\n${userNickname}，刚才在后台处理的任务遇到异常中断：${friendlyReason}。稍候可精简任务内容后重试～`;
+          const errorNotice = execErr.agentFailure === 'auth'
+            ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`
+            : `🔔 【后台任务执行提醒】\n${userNickname}，刚才在后台处理的任务遇到异常中断：${friendlyReason}。稍候可精简任务内容后重试～`;
           await deliverResultToWechat(toUser, targetToken, errorNotice, '', true);
         } catch (postErr) {
           console.error(`[后台异常通知发送失败]:`, postErr.message);
         } finally {
           activeBackgroundTasks.delete(taskKey);
         }
+      })
+      .finally(() => {
+        // 后台任务结束，释放主会话
+        if (useMainConversation) {
+          mainConversationBusy = false;
+        }
       });
   }
 
   console.log(`====================================================\n`);
+  return backgroundDone ? { background: backgroundDone } : null;
 }
 
-async function processQueue() {
-  if (isProcessingQueue) return;
-  isProcessingQueue = true;
+// 正在处理（含转入后台）的消息 ID，防止同一条消息被重复拉起
+const inFlightMessageIds = new Set();
+let pumping = false;
 
-  while (messageQueue.length > 0) {
-    const task = messageQueue.shift();
-    try {
-      await handleWechatTask(task);
-    } catch (err) {
-      console.error('[队列任务执行异常]:', err);
+function isHandled(messageId) {
+  return (loadRuntimeState('routine').recent_handled_ids || []).includes(messageId);
+}
+
+function rememberHandled(messageId) {
+  const handled = loadRuntimeState('routine').recent_handled_ids || [];
+  if (handled.includes(messageId)) return;
+  saveRuntimeState('routine', { recent_handled_ids: [...handled, messageId].slice(-500) });
+}
+
+/**
+ * 按时间顺序从收件箱取消息处理。同时运行的智能体达到上限时先不取，等有空位再继续。
+ * 处理完（含后台任务结束）才记为已处理并删除文件；中途崩溃的消息会在下次启动时重新处理。
+ */
+async function pumpInbox() {
+  if (pumping) return;
+  pumping = true;
+  const skipped = new Set();
+  try {
+    while (activeAgents < MAX_ACTIVE_AGENTS) {
+      const fileName = listPending().find((f) => !skipped.has(f) && !inFlightMessageIds.has(messageIdFromFileName(f)));
+      if (!fileName) break;
+      const messageId = messageIdFromFileName(fileName);
+
+      let claimedPath = null;
+      let task;
+      try {
+        claimedPath = claimInbox(fileName);
+        task = JSON.parse(fs.readFileSync(claimedPath, 'utf-8'));
+      } catch (err) {
+        console.error(`[收件箱] 无法读取 ${fileName}，移到 failed/:`, err.message);
+        skipped.add(fileName);
+        try { failInbox(fileName, claimedPath ? 'processing' : 'pending'); } catch {}
+        raiseAlert('message_failed', `收件箱里有一条消息文件读不出来（${fileName}），已移到 failed/`);
+        continue;
+      }
+
+      if (isHandled(messageId)) {
+        console.log(`[去重] 消息 ${messageId} 已经处理过，跳过。`);
+        finishInbox(claimedPath);
+        continue;
+      }
+
+      inFlightMessageIds.add(messageId);
+      const complete = () => {
+        rememberHandled(messageId);
+        finishInbox(claimedPath);
+        inFlightMessageIds.delete(messageId);
+      };
+      try {
+        const result = await handleWechatTask(task);
+        if (result && result.background) {
+          result.background.finally(() => {
+            complete();
+            pumpInbox().catch((e) => console.error('[收件箱处理异常]:', e));
+          });
+        } else {
+          complete();
+        }
+      } catch (err) {
+        inFlightMessageIds.delete(messageId);
+        const outcome = retryOrFailInbox(claimedPath, task);
+        console.error(`[收件箱] 处理消息 ${messageId} 出错（${outcome === 'retry' ? '稍后重试' : '已移到 failed/'}）:`, err.message);
+        if (outcome === 'failed') {
+          raiseAlert('message_failed', `一条消息处理 3 次都失败，已移到 failed/（${messageId}）：${err.message}`);
+        }
+      }
     }
+  } finally {
+    pumping = false;
   }
-
-  isProcessingQueue = false;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -845,7 +976,14 @@ const server = http.createServer(async (req, res) => {
 
   // Webhook endpoint
   if (req.method === 'POST' && url.pathname === '/webhook/wechat') {
-    const config = loadConfig();
+    let config;
+    try {
+      config = loadConfig();
+    } catch (err) {
+      console.error('[Webhook 读取配置失败]:', err.message);
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'config unavailable' }));
+    }
     const expectedKey = config.webhook_key;
 
     // Verify webhook key
@@ -866,21 +1004,26 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const payload = JSON.parse(body);
-        const { from_user_id, message_text, context_token } = payload;
+        const { from_user_id, message_text, context_token, message_id } = payload;
 
         if (!message_text) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: 'Missing message_text' }));
         }
 
-        // 立即确认应答，避免 HTTP 挂死/超时断开
+        // 先落进收件箱再应答：返回成功就代表这条消息已经安全落盘，不会丢
+        enqueueInbox({
+          message_id: message_id || `webhook-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          create_time_ms: Date.now(),
+          from_user_id,
+          message_text,
+          context_token,
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, queued: true }));
 
-        // 压入排队队列按序执行，彻底规避 agy 并发会话死锁
-        messageQueue.push({ from_user_id, message_text, context_token });
-        processQueue().catch((err) => {
-          console.error('[processQueue 异常]:', err);
+        pumpInbox().catch((err) => {
+          console.error('[收件箱处理异常]:', err);
         });
       } catch (err) {
         console.error('[Webhook 处理异常]:', err);
@@ -899,4 +1042,13 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[微信下旨入口] 本地 Webhook Routine 正在监听: http://${HOST}:${PORT}/webhook/wechat (工作目录: ${botRoot})`);
+
+  // 上次没处理完的消息放回队列，然后开始按顺序处理收件箱
+  const requeued = requeueProcessing();
+  if (requeued > 0) {
+    console.log(`[收件箱] 上次有 ${requeued} 条消息没处理完，已放回队列重新处理。`);
+  }
+  const pump = () => pumpInbox().catch((err) => console.error('[收件箱处理异常]:', err));
+  pump();
+  setInterval(pump, 1000);
 });

@@ -1,6 +1,6 @@
 {
   "topics": [
-    { "name": "健身训练分卷", "file": "fitness.md", "keywords": ["健身", "训练", "跑步", "gym"] },
-    { "name": "读书笔记分卷", "file": "reading.md", "keywords": ["读书", "书单", "笔记"] }
+    { "name": "健康作息分卷", "file": "health.md", "keywords": ["睡眠", "作息", "运动", "体检", "饮食"] },
+    { "name": "工作项目分卷", "file": "work.md", "keywords": ["项目", "会议", "客户", "周报", "上线"] }
   ]
 }

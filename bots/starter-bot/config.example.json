@@ -1,14 +1,11 @@
 {
   "port": 18888,
   "webhook_url": "http://127.0.0.1:18888/webhook/wechat",
-  "webhook_key": "sec_wxcb_starter_random_key",
+  "webhook_key": "",
   "base_url": "https://ilinkai.weixin.qq.com",
   "bot_token": "",
   "authorized_user_id": "",
   "user_nickname": "主人",
   "bot_name": "小助理",
-  "forbidden_persona": "",
-  "last_context_token": "",
-  "get_updates_buf": "",
-  "conversation_id": null
+  "forbidden_persona": ""
 }

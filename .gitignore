@@ -1,29 +1,29 @@
-# 依赖与环境
+# 依赖
 node_modules/
 __pycache__/
 *.pyc
 .env
 
-# 隐私配置与动态认证凭证 (绝不上云)
-**/config.json
-!**/config.example.json
-**/tasks.js
-!**/tasks.example.js
-bilibili_config.json
-!bilibili_config.example.json
+# 告警配置（里面有邮箱授权码）和监控状态
+/alert.json
+/data/
 
-# 媒体下载临时文件与二维码
-**/downloads/*
-!**/downloads/.gitkeep
+# 机器人目录：仓库里只放说明和 starter-bot 的模板，你自己建的机器人都不进 git
+bots/*
+!bots/README.md
+!bots/starter-bot/
+# starter-bot 里由安装脚本和扫码登录生成的配置、人设、记忆、任务和运行数据也不进 git
+bots/starter-bot/config.json
+bots/starter-bot/MEMORY.md
+bots/starter-bot/tasks.js
+bots/starter-bot/topics.json
+bots/starter-bot/data/
 **/qrcode.png
 
-# 对话与运行历史记录
-**/chat_history.log
-**/reminders.json
-!**/reminders.example.json
-**/scheduler_state.json
+# 技能里的登录凭证
+bilibili_config.json
 
-# 编译与构建输出
+# 打包输出
 dist/
 *.tar.gz
 *.zip

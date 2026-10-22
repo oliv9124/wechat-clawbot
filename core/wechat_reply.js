@@ -6,12 +6,11 @@ import { execFileSync } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// 配置只认当前实例目录（cwd）下的 config.json，不再回退到 core/ 目录，避免多个实例共用一份凭证
 export function getConfigPath(customPath = null) {
   if (customPath) return customPath;
   if (process.env.BOT_CONFIG_PATH) return process.env.BOT_CONFIG_PATH;
-  const cwdConfig = path.join(process.cwd(), 'config.json');
-  if (fs.existsSync(cwdConfig)) return cwdConfig;
-  return path.join(__dirname, 'config.json');
+  return path.join(process.cwd(), 'config.json');
 }
 
 export function randomWechatUin() {
@@ -19,23 +18,77 @@ export function randomWechatUin() {
   return Buffer.from(String(uint32), 'utf-8').toString('base64');
 }
 
-export function loadConfig(customPath = null) {
-  const targetPath = getConfigPath(customPath);
-  if (fs.existsSync(targetPath)) {
-    try {
-      return JSON.parse(fs.readFileSync(targetPath, 'utf-8'));
-    } catch {
-      return {};
-    }
-  }
-  return {};
+// 日志默认不记录消息原文、文件名和令牌；排查问题时设环境变量 CLAWBOT_LOG_CONTENT=1 才打印原文
+export const LOG_CONTENT = process.env.CLAWBOT_LOG_CONTENT === '1';
+
+export function describeText(text) {
+  const s = String(text ?? '');
+  return LOG_CONTENT ? JSON.stringify(s) : `${[...s].length} 字`;
 }
 
+export function describePath(p) {
+  if (LOG_CONTENT) return p;
+  return `${path.dirname(p)}/<${path.extname(p) || '无扩展名'}>`;
+}
+
+/**
+ * 原子写 JSON：先写同目录下的临时文件再 rename，读的一方永远看不到写了一半的内容。
+ */
+export function writeJsonAtomic(targetPath, data) {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  fs.renameSync(tmpPath, targetPath);
+}
+
+/**
+ * 读 JSON：文件不存在返回 {}；内容损坏直接抛错，绝不能把 {} 当成真实内容再写回去。
+ */
+function readJsonStrict(targetPath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(targetPath, 'utf-8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return {};
+    throw err;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${targetPath} 不是合法的 JSON，已拒绝使用（${err.message}）`);
+  }
+}
+
+export function loadConfig(customPath = null) {
+  return readJsonStrict(getConfigPath(customPath));
+}
+
+// config.json 只放静态配置与凭证，只应由扫码登录（login.js）写入；运行中变化的数据请用 saveRuntimeState
 export function saveConfig(updates, customPath = null) {
   const targetPath = getConfigPath(customPath);
-  const current = loadConfig(targetPath);
-  const next = { ...current, ...updates };
-  fs.writeFileSync(targetPath, JSON.stringify(next, null, 2), 'utf-8');
+  const next = { ...readJsonStrict(targetPath), ...updates };
+  writeJsonAtomic(targetPath, next);
+  return next;
+}
+
+/**
+ * 运行时状态放在 <实例目录>/data/state/<name>.json，每个文件只由一个进程写：
+ *   forwarder.json  → wechat_forwarder.js（get_updates_buf、last_context_token、last_user_message_at）
+ *   routine.json    → routine_server.js（conversation_id）
+ *   scheduler.json、reply_window.json → scheduler.js（心跳和任务表；微信窗口关闭 / 已提醒对方回消息）
+ */
+export function getRuntimeStatePath(name) {
+  return path.join(process.cwd(), 'data', 'state', `${name}.json`);
+}
+
+export function loadRuntimeState(name) {
+  return readJsonStrict(getRuntimeStatePath(name));
+}
+
+export function saveRuntimeState(name, updates) {
+  const targetPath = getRuntimeStatePath(name);
+  const next = { ...readJsonStrict(targetPath), ...updates };
+  writeJsonAtomic(targetPath, next);
   return next;
 }
 
@@ -44,18 +97,18 @@ export function saveConfig(updates, customPath = null) {
  */
 export function stripMarkdown(text) {
   if (!text) return '';
-  let str = text;
-  // Code blocks: remove ```language and ```
-  str = str.replace(/```[a-zA-Z0-9_\-\s]*\n([\s\S]*?)```/g, '$1');
-  // Inline code: remove `
-  str = str.replace(/`([^`]+)`/g, '$1');
+  // 代码块和行内代码先原样保护起来，里面的 * _ 等符号一律不动，最后再放回（只去掉反引号）
+  const codes = [];
+  const keep = (code) => `\u0000${codes.push(code) - 1}\u0000`;
+  let str = String(text)
+    .replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => keep(code.replace(/\n$/, '')))
+    .replace(/`([^`\n]+)`/g, (_, code) => keep(code));
   // Headings: remove #, ##, etc.
   str = str.replace(/^#{1,6}\s+(.*)$/gm, '$1');
-  // Bold & Italic: **text**, *text*, __text__, _text_
-  str = str.replace(/\*\*([^*]+)\*\*/g, '$1');
-  str = str.replace(/\*([^*]+)\*/g, '$1');
-  str = str.replace(/__([^_]+)__/g, '$1');
-  str = str.replace(/_([^_]+)_/g, '$1');
+  // 加粗 **text**；斜体 *text* 只认两侧不是英文字母或数字的星号，3*4*5 这类算式保持原样。
+  // 下划线不当格式处理：wechat_routine_2、__init__.py 这类名字原样保留
+  str = str.replace(/\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*/g, '$1');
+  str = str.replace(/(^|[^A-Za-z0-9*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![A-Za-z0-9*])/gm, '$1$2');
   // Blockquotes: remove >
   str = str.replace(/^>\s?(.*)$/gm, '$1');
   // Links: [text](url) -> text (url)
@@ -64,6 +117,8 @@ export function stripMarkdown(text) {
   str = str.replace(/\(?file:\/\/\/[^\s\)\"\']+\)?/gi, '');
   // Bullet lists: * or - to standard bullet
   str = str.replace(/^[\*\-]\s+/gm, '• ');
+  // 放回代码内容
+  str = str.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[Number(i)]);
   return str.trim();
 }
 
@@ -114,9 +169,9 @@ export async function getTypingTicket(userId, contextToken, overrideConfig) {
 
 /**
  * Send typing indicator ("对方正在输入...") to WeChat chat window.
- * status: 1 = start typing, 2 = stop typing
+ * status: 1 = start typing, 2 = stop typing；quiet: 定时重发时不写日志
  */
-export async function sendWechatTyping(userId, contextToken, status = 1, overrideConfig) {
+export async function sendWechatTyping(userId, contextToken, status = 1, overrideConfig, { quiet = false } = {}) {
   try {
     const config = overrideConfig || loadConfig();
     const baseUrl = (config.base_url || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
@@ -143,7 +198,7 @@ export async function sendWechatTyping(userId, contextToken, status = 1, overrid
       }),
     });
     // status 1 = start typing, 2 = stop typing
-    if (status === 1) {
+    if (status === 1 && !quiet) {
       console.log(`[sendtyping] 已向微信发送“正在输入...”状态 (HTTP ${res.status})`);
     }
   } catch (err) {
@@ -203,8 +258,7 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
     },
   };
 
-  console.log(`[sendmessage 发送给微信]: to=${toUserId} text="${plainText}"`);
-  console.log(`[sendmessage 完整 Payload]:`, JSON.stringify(payload));
+  console.log(`[sendmessage 发送给微信]: to=${toUserId} 文本 ${describeText(plainText)}`);
 
   const res = await fetch(endpoint, {
     method: 'POST',
@@ -213,7 +267,6 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
   });
 
   const raw = await res.text();
-  console.log(`[sendmessage 微信服务端原始返回]: HTTP ${res.status} Body: ${raw}`);
   let json;
   try {
     json = JSON.parse(raw);
@@ -222,8 +275,8 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
   }
 
   if (!res.ok || (json.ret !== undefined && json.ret !== 0) || (json.errcode !== undefined && json.errcode !== 0)) {
-    console.error('[sendmessage failed]', res.status, raw);
-    throw new Error(`sendmessage failed: ${raw}`);
+    console.error('[sendmessage failed]', res.status, raw.slice(0, 300));
+    throw new Error(`sendmessage failed: HTTP ${res.status} ${raw.slice(0, 300)}`);
   }
 
   console.log(`[sendmessage success] to=${toUserId} msg_id=${json.message_id || 'ok'}`);
@@ -463,7 +516,7 @@ export async function uploadAndSendWechatFile(toUserId, contextToken, filePath, 
   });
 
   const sendData = await sendRes.json();
-  console.log(`[sendFile success] to=${toUserId} file=${fileName} msg_id=${sendData.message_id || 'ok'}`);
+  console.log(`[sendFile success] to=${toUserId} file=${describePath(filePath)} msg_id=${sendData.message_id || 'ok'}`);
   return sendData;
 }
 
@@ -603,7 +656,7 @@ export async function uploadAndSendWechatVideo(toUserId, contextToken, videoPath
 
   try {
     const videoBuf = fs.readFileSync(videoPath);
-    console.log(`[正在上传原生视频本体至微信 CDN]: ${videoPath} (${videoBuf.length} 字节)...`);
+    console.log(`[正在上传原生视频本体至微信 CDN]: ${describePath(videoPath)} (${videoBuf.length} 字节)...`);
     const videoUp = await uploadBufferToCdn(videoBuf, 2, toUserId, config); // 2 = MEDIA_VIDEO
 
     console.log(`[正在上传原生视频封面图至微信 CDN]: (${thumbBuf.length} 字节)...`);
