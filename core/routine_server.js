@@ -33,7 +33,7 @@ import {
 import { RESET_MARKER, loadTopicsConfig, capForLoading, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS, TOPIC_ALWAYS_BUDGET } from './memory_config.js';
 import { memoryMode, useStandaloneHistory, parseMemoryCommand, findBotByName, showChanges, undoItems } from './memory_history.js';
 import { raiseAlert } from './alert.js';
-import { agentOutcome, recordAgentResult } from './agent_health.js';
+import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
@@ -284,12 +284,12 @@ function runAgent(promptText, conversationId = null) {
     if (conversationId) {
       args.push('--conversation', conversationId);
     }
-    args.push('-p', promptText, '--output-format', 'json');
+    args.push(...AGY_STREAM_ARGS);
 
     console.log(`[调用 agy]: 会话ID=${conversationId || '(全新会话)'}`);
 
     activeAgents++;
-    execFile(
+    const child = execFile(
       'agy',
       args,
       {
@@ -300,8 +300,8 @@ function runAgent(promptText, conversationId = null) {
       },
       (error, stdout, stderr) => {
         activeAgents--;
-        // 退出码为 0 但输出里 status 是 ERROR 的也算失败（比如登录失效）
-        const outcome = agentOutcome(error, stdout, stderr);
+        // 退出码为 0 但输出里 status 是 ERROR 的也算失败（比如登录失效）；没有 result 事件也算失败
+        const outcome = agyOutcome(error, stdout, stderr);
         if (!outcome.ok) {
           // 会话本身接不上才值得换新会话重试；登录失效、超时，重试也一样失败，只会让用户多等
           if (conversationId && outcome.kind === 'error') {
@@ -312,7 +312,7 @@ function runAgent(promptText, conversationId = null) {
               .catch(reject);
           }
           recordAgentResult('routine', outcome);
-          // error.message 里带着完整命令行（也就是整段 prompt），日志和报错都只用退出码和错误输出的末尾
+          // 日志和报错只用退出码和错误输出的末尾，不用 error.message（里面是完整命令行）
           const detail = outcome.kind === 'auth'
             ? outcome.reason
             : String(stderr || '').trim().slice(-300) || `exit ${error?.code ?? error?.signal ?? 'status ERROR'}`;
@@ -324,11 +324,14 @@ function runAgent(promptText, conversationId = null) {
 
         recordAgentResult('routine', outcome);
         if (outcome.warning) console.warn(`[agy 提示] 有回复，但带着提示（照常使用回复）：${outcome.warning}`);
-        resolve(outcome.json
-          ? { reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId }
-          : { reply: stdout.trim(), conversationId });
+        const usage = outcome.json.usage;
+        if (usage) console.log(`[agy 用量]: 输入 ${usage.input_tokens ?? '?'} tokens，输出 ${usage.output_tokens ?? '?'} tokens`);
+        resolve({ reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId });
       }
     );
+    // 提示词从标准输入交过去；agy 提前退出时写入会报 EPIPE，忽略即可（结果由上面的回调处理）
+    child.stdin.on('error', () => {});
+    child.stdin.end(agyInputLine(promptText));
   });
 }
 
@@ -386,6 +389,36 @@ const MAX_ACTIVE_AGENTS = 2;
 const SOFT_TIMEOUT_MS = Number(process.env.ROUTINE_SOFT_TIMEOUT_MS) || 90000;
 // 等结果期间每隔多久重发一次"正在输入"，免得对方以为没反应（环境变量仅供测试）
 const TYPING_REFRESH_MS = Number(process.env.ROUTINE_TYPING_REFRESH_MS) || 20000;
+// 主会话每天换一次：北京时间 03:30（凌晨整理完记忆）以后的第一条消息开新会话；会话库太大时也提前换。
+// 不写重置标记：最近几轮聊天和长期记忆照常带上，只是 agy 不再背着越来越长的历史（环境变量仅供测试）
+const ROTATE_AT_MINUTES = Number(process.env.ROUTINE_ROTATE_AT_MINUTES || 210);
+const ROTATE_MAX_BYTES = Number(process.env.ROUTINE_ROTATE_MAX_BYTES) || 20 * 1024 * 1024;
+
+// 最近一次已经过去的北京时间 03:30（毫秒时间戳）
+function lastRotationBoundary(now = Date.now()) {
+  const bj = new Date(now + 8 * 3600000);
+  let boundary = Date.UTC(bj.getUTCFullYear(), bj.getUTCMonth(), bj.getUTCDate()) - 8 * 3600000 + ROTATE_AT_MINUTES * 60000;
+  if (boundary > now) boundary -= 86400000;
+  return boundary;
+}
+
+// 主会话该不该换：返回原因，不用换返回 null
+function conversationRotationReason(state, convId) {
+  if (!convId) return null;
+  const startedAt = Number(state.conversation_started_at) || 0;
+  if (!startedAt) {
+    // 以前存下的会话没有开始时间：从现在算起，过了下一个 03:30 再换
+    saveRuntimeState('routine', { conversation_started_at: Date.now() });
+    return null;
+  }
+  if (startedAt < lastRotationBoundary()) return '已经过了凌晨整理记忆的时间';
+  try {
+    const db = path.join(process.env.HOME || '', '.gemini', 'antigravity-cli', 'conversations', `${convId}.db`);
+    const size = fs.statSync(db).size;
+    if (size > ROTATE_MAX_BYTES) return `会话库已经有 ${(size / 1048576).toFixed(1)}MB`;
+  } catch {}
+  return null;
+}
 
 // 会话占用锁：主会话被转入后台的任务占着时，新消息改用临时会话，避免两个 agy 同时写同一个会话
 let mainConversationBusy = false;
@@ -728,9 +761,15 @@ async function handleWechatTask(task) {
   // 会话占用锁：主会话空闲就用主会话；正被转入后台的任务占着时，改用临时会话，结果也不回写主会话 ID
   const useMainConversation = !mainConversationBusy;
   const generation = mainConversationGeneration;
-  const currentConvId = useMainConversation ? loadRuntimeState('routine').conversation_id || null : null;
+  const routineState = useMainConversation ? loadRuntimeState('routine') : {};
+  let currentConvId = useMainConversation ? routineState.conversation_id || null : null;
   if (!useMainConversation) {
     console.log('[会话占用] 主会话正被后台任务使用，本条消息改用临时会话处理。');
+  }
+  const rotateReason = conversationRotationReason(routineState, currentConvId);
+  if (rotateReason) {
+    console.log(`[会话轮换] ${rotateReason}，这条消息开新会话（最近的聊天和长期记忆照常带上）。`);
+    currentConvId = null;
   }
   const rememberConversation = (res) => {
     if (!useMainConversation || !res.conversationId || res.conversationId === currentConvId) return;
@@ -738,7 +777,7 @@ async function handleWechatTask(task) {
       console.log('[会话已重置] 任务期间用户重置了会话，不再回写这次的会话 ID。');
       return;
     }
-    saveRuntimeState('routine', { conversation_id: res.conversationId });
+    saveRuntimeState('routine', { conversation_id: res.conversationId, conversation_started_at: Date.now() });
     console.log(`[已持久化会话记忆 ID]: ${res.conversationId}`);
   };
   const withConversationNotice = (res, text) => (res.resumeFailed ? `${text}\n\n${CONVERSATION_LOST_NOTICE}` : text);

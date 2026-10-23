@@ -6,7 +6,7 @@ import { sendWechatReply, loadConfig, loadRuntimeState, saveRuntimeState, descri
 import { loadTopicsConfig, textAfterLastReset, listMemoryFiles, capForLoading, charCount, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS } from './memory_config.js';
 import { memoryMode, useStandaloneHistory, snapshotAll, buildDigest, markDigestDelivered, syncBotDigests } from './memory_history.js';
 import { raiseAlert } from './alert.js';
-import { agentOutcome, recordAgentResult } from './agent_health.js';
+import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
 
 const botRoot = process.cwd();
 
@@ -473,13 +473,16 @@ ${chunk}`;
 
 function runConsolidationAgent(promptText) {
   return new Promise((resolve) => {
-    const args = ['--dangerously-skip-permissions', '-p', promptText, '--output-format', 'json'];
-    execFile(
+    const args = ['--dangerously-skip-permissions', ...AGY_STREAM_ARGS];
+    const child = execFile(
       'agy',
       args,
       { cwd: botRoot, timeout: CONSOLIDATION_TIMEOUT_MS, env: process.env, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout, stderr) => resolve({ outcome: agentOutcome(err, stdout, stderr), err, stderr })
+      (err, stdout, stderr) => resolve({ outcome: agyOutcome(err, stdout, stderr), err, stderr })
     );
+    // 提示词（含昨天的聊天记录）从标准输入交过去，不放在命令行参数里
+    child.stdin.on('error', () => {});
+    child.stdin.end(agyInputLine(promptText));
   });
 }
 
@@ -553,7 +556,7 @@ export async function runNightlyConsolidation({ day } = {}) {
       recordAgentResult('scheduler', outcome);
       if (!outcome.ok) {
         result = 'failed';
-        // err.message 里带着完整命令行（含昨天的聊天记录），只记退出码和错误输出的末尾
+        // 只记退出码和错误输出的末尾，不用 err.message（里面是完整命令行）
         const detail = outcome.kind === 'auth'
           ? outcome.reason
           : String(stderr || '').trim().slice(-300) || `exit ${err?.code ?? err?.signal ?? 'status ERROR'}`;

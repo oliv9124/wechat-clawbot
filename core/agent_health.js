@@ -52,3 +52,31 @@ export function recordAgentResult(proc, outcome) {
     console.error('[记录智能体调用结果失败]:', e.message);
   }
 }
+
+// 提示词从标准输入交给 agy（--input-format stream-json），不放在命令行参数里：
+// 命令行参数本机任何账号都能从 /proc 读到，而提示词里有聊天内容和记忆。
+// 输出也换成 stream-json：最后一条 result 事件，就是原来 --output-format json 打印的那个对象。
+export const AGY_STREAM_ARGS = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
+
+export function agyInputLine(promptText) {
+  return `${JSON.stringify({ event: 'user', message: { role: 'user', content: [{ type: 'text', text: promptText }] } })}\n`;
+}
+
+// 从 stream-json 输出里取最后一条 result 事件，换成原来 json 输出的文本；没有 result 事件时返回空串
+export function agyResultText(stdout) {
+  const lines = String(stdout || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const ev = JSON.parse(lines[i]);
+      if (ev?.event === 'result' && ev.result) return JSON.stringify(ev.result);
+    } catch {}
+  }
+  return '';
+}
+
+// stream-json 调用的结果：判断方式和 agentOutcome 一样；另外正常退出却没有 result 事件也算失败（不能把事件流当回复发出去）
+export function agyOutcome(error, stdout, stderr) {
+  const outcome = agentOutcome(error, agyResultText(stdout), stderr);
+  if (outcome.ok && !outcome.json) return { ok: false, kind: 'error', reason: 'agy 没有给出结果', json: null };
+  return outcome;
+}
