@@ -228,7 +228,8 @@ function extractMediaPaths(text) {
 
 
   // 智能兜底探测：如果 Agent 在回复中路径书写有偏差或被截断，但本 Bot 的 downloads 目录下近 3 分钟内有新下载的视频，自动保底推送！
-  if (videos.size === 0) {
+  // 只在回复说的是视频、下载这类事时兜底：后台下载还没交付时，另一条不相干的回复（比如问天气）不会把视频顺手带走
+  if (videos.size === 0 && /视频|下载|原画|卡片|抖音|B站|小红书|mp4/i.test(text)) {
     const downloadDirs = [
       path.join(botRoot, 'data', 'downloads'),
       path.join(botRoot, 'downloads'),
@@ -381,6 +382,10 @@ const pushRateLimiter = new PushRateLimiter();
 
 // 活跃后台任务集合（存储 key: "userId:messageText"），实现防重与幂等
 const activeBackgroundTasks = new Set();
+// 已经转入后台、还没跑完的任务：key → 这条消息开始处理的时间。期间问进度直接回，不再开一个新的智能体会话
+// （新会话看不到后台任务做到哪了，还要花一两分钟和十几万 tokens）
+const backgroundTasks = new Map();
+const STATUS_QUESTION = /^(咋样了?|怎么样了?|好了吗|好了没有?|好了么|好没好|进度(呢|如何|怎么样)?|还没好吗?|还要多久|要多久|多久|完成了吗|完成了没|弄好了吗|弄好了没|搞定了吗|搞定了没|搞定没|还在弄吗|到哪了|到哪一步了)[\s啊呀呢吧嘛哈～~。.!！?？…]*$/;
 
 // 同时最多运行的智能体数量（含转入后台的任务），超出的消息留在收件箱里排队
 const MAX_ACTIVE_AGENTS = 2;
@@ -429,10 +434,42 @@ const CONVERSATION_LOST_NOTICE = '（提示：原来的会话没能接上，已�
 // 智能体登录失效时回给用户的话（监控会同时通知主人去重新登录）
 const agentLoginNotice = (botName) => `${botName}这会儿连不上智能体（登录失效了），已经通知去处理了，稍后再试哦～`;
 
+// 自动发过的媒体：同一个文件（路径 + 修改时间 + 大小）1 小时内只自动发一次。后台任务的结果和接着问的一句常会提到同一个文件，
+// 不记一下就会发两遍。记在 data/state/sent_media.json（只存哈希，不存文件名），重启也不丢；用户明确要再发时照发
+const SENT_MEDIA_TTL_MS = 3600_000;
+const RESEND_REQUEST = /再发|重发|重新发|没收到|收不到|发不出|打不开|看不了/;
+function mediaKey(p) {
+  try {
+    const st = fs.statSync(p);
+    return crypto.createHash('sha1').update(`${p}|${st.mtimeMs}|${st.size}`).digest('hex').slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+function recentSentMedia() {
+  const now = Date.now();
+  return (loadRuntimeState('sent_media').items || []).filter((x) => now - x.at < SENT_MEDIA_TTL_MS);
+}
+function unsentMedia(media, userText) {
+  if (RESEND_REQUEST.test(userText || '')) return media;
+  const sent = new Set(recentSentMedia().map((x) => x.key));
+  const keep = (list = []) => list.filter((p) => {
+    if (!sent.has(mediaKey(p))) return true;
+    console.log(`[媒体去重]: ${describePath(p)} 1 小时内已经发过，这次只发文字`);
+    return false;
+  });
+  return { images: keep(media.images), videos: keep(media.videos), files: keep(media.files) };
+}
+function markMediaSent(p) {
+  const key = mediaKey(p);
+  if (key) saveRuntimeState('sent_media', { items: [...recentSentMedia(), { key, at: Date.now() }].slice(-200) });
+}
+
 /**
- * 聚合交付下发引擎：将文本回复与附带媒体（图片/原生视频卡片/文件）安全推送到微信
+ * 聚合交付下发引擎：将文本回复与附带媒体（图片/原生视频卡片/文件）安全推送到微信。
+ * userText 是引出这条回复的用户消息：用户要"再发"时，1 小时内发过的媒体照样发
  */
-async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgentReply, isAsyncCallback = false) {
+async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgentReply, isAsyncCallback = false, userText = '') {
   const config = loadConfig();
   // 去 Markdown 统一在 sendWechatReply 里做一次；这里再做一遍会伤到已经去掉反引号的代码内容
   const plainReply = textReply;
@@ -452,8 +489,8 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
     raiseAlert('reply_failed', `一条回复没发出去：${replyErr.message}`);
   }
 
-  // 2. 检查是否有新鲜生成的媒体 (图片 / 视频 / 文件)
-  const media = extractMediaPaths(rawAgentReply || textReply);
+  // 2. 检查是否有新鲜生成的媒体 (图片 / 视频 / 文件)；1 小时内自动发过的同一个文件不再发
+  const media = unsentMedia(extractMediaPaths(rawAgentReply || textReply), userText);
 
   // 2.1 图片 (仅推 1 张最新图片)
   if (media.images && media.images.length > 0) {
@@ -462,6 +499,7 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
       console.log(`[正在上传并发送图片至微信]: ${describePath(latestImg)}`);
       await uploadAndSendWechatImage(toUserId, contextToken, latestImg, config);
+      markMediaSent(latestImg);
       console.log(`[已成功将图片卡片发送至微信]: ${describePath(latestImg)}`);
     } catch (imgErr) {
       console.error(`[发送微信图片卡片失败]:`, imgErr.message);
@@ -475,6 +513,7 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
       console.log(`[正在上传并发送原生视频卡片至微信]: ${describePath(latestVideo)}`);
       await uploadAndSendWechatVideo(toUserId, contextToken, latestVideo, config);
+      markMediaSent(latestVideo);
       console.log(`[已成功将原生视频卡片发送至微信]: ${describePath(latestVideo)}`);
     } catch (vidErr) {
       console.error(`[发送微信原生视频卡片失败]:`, vidErr.message);
@@ -488,6 +527,7 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
       console.log(`[正在上传并发送文件至微信]: ${describePath(latestFile)}`);
       await uploadAndSendWechatFile(toUserId, contextToken, latestFile, config);
+      markMediaSent(latestFile);
       console.log(`[已成功将文件发送至微信]: ${describePath(latestFile)}`);
     } catch (fileErr) {
       console.error(`[发送微信文件失败]:`, fileErr.message);
@@ -736,6 +776,22 @@ async function handleWechatTask(task) {
   const personaDesc = config.persona_description || `【${botName}】`;
   const forbiddenPrompt = config.forbidden_persona ? `严禁称呼用户为“${config.forbidden_persona}”。` : '';
 
+  // 后台任务还没跑完时问进度：直接回，不调用智能体
+  if (backgroundTasks.size > 0 && STATUS_QUESTION.test(message_text.trim())) {
+    const minutes = Math.max(1, Math.round((Date.now() - Math.min(...backgroundTasks.values())) / 60000));
+    const status = backgroundTasks.size > 1
+      ? `还有 ${backgroundTasks.size} 个任务在后台弄，最早的那个已经 ${minutes} 分钟了`
+      : `刚才那个任务还在后台弄，已经 ${minutes} 分钟了`;
+    const statusReply = `${userNickname}，${status}，好了${botName}马上发你～`;
+    console.log('[进度询问]: 还有任务在后台跑，直接回复进度，不调用智能体');
+    if (from_user_id && context_token) {
+      await sendWechatReply(from_user_id, context_token, statusReply, config);
+    }
+    appendLog(`AI回复(进度): ${statusReply}`);
+    console.log(`====================================================\n`);
+    return null;
+  }
+
   // 幂等防重检查：如果同一个任务正在后台运行，直接温和提示，不重复启动
   const taskKey = `${from_user_id}:${message_text.trim()}`;
   // 日志里用短哈希指代任务，不记消息原文
@@ -787,6 +843,7 @@ async function handleWechatTask(task) {
 
   // 标记活跃后台任务
   activeBackgroundTasks.add(taskKey);
+  const startedAt = Date.now();
 
   // 启动智能体执行 (10分钟超时保护)
   const agentPromise = runAgent(fullMessage, currentConvId);
@@ -844,7 +901,7 @@ async function handleWechatTask(task) {
     console.log(`[Antigravity 回复]: ${describeText(plainReply)}`);
 
     if (from_user_id && context_token) {
-      await deliverResultToWechat(from_user_id, context_token, plainReply, rawReply, false);
+      await deliverResultToWechat(from_user_id, context_token, plainReply, rawReply, false, message_text);
       await sendWechatTyping(from_user_id, context_token, 2, config);
     }
   } else {
@@ -855,6 +912,7 @@ async function handleWechatTask(task) {
     if (useMainConversation) {
       mainConversationBusy = true;
     }
+    backgroundTasks.set(taskKey, startedAt);
 
     // 【第 1 段消息】：使用当前新鲜有效的 context_token 秒级接单预告
     const handoverNotice = `${userNickname}，这个要多花点时间，${botName}在后台接着弄，好了马上发你～`;
@@ -885,7 +943,7 @@ async function handleWechatTask(task) {
           const headerPrefix = `🔔 【后台任务完成通知】\n${userNickname}，您交办的长任务已全部处理完成：\n\n`;
           const finalReply = headerPrefix + withConversationNotice(agentRes, rawReply);
 
-          await deliverResultToWechat(toUser, targetToken, finalReply, rawReply, true);
+          await deliverResultToWechat(toUser, targetToken, finalReply, rawReply, true, message_text);
           console.log(`✅ [后台长任务结果已成功推送至微信 (第 2 条消息)]\n`);
         } catch (postErr) {
           console.error(`[后台任务结果交付异常]:`, postErr.message);
@@ -908,7 +966,7 @@ async function handleWechatTask(task) {
           const errorNotice = execErr.agentFailure === 'auth'
             ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`
             : `🔔 【后台任务执行提醒】\n${userNickname}，刚才在后台处理的任务遇到异常中断：${friendlyReason}。稍候可精简任务内容后重试～`;
-          await deliverResultToWechat(toUser, targetToken, errorNotice, '', true);
+          await deliverResultToWechat(toUser, targetToken, errorNotice, '', true, message_text);
         } catch (postErr) {
           console.error(`[后台异常通知发送失败]:`, postErr.message);
         } finally {
@@ -917,6 +975,7 @@ async function handleWechatTask(task) {
       })
       .finally(() => {
         // 后台任务结束，释放主会话
+        backgroundTasks.delete(taskKey);
         if (useMainConversation) {
           mainConversationBusy = false;
         }
