@@ -7,6 +7,7 @@ import { loadTopicsConfig, textAfterLastReset, listMemoryFiles, capForLoading, c
 import { memoryMode, useStandaloneHistory, snapshotAll, buildDigest, markDigestDelivered, syncBotDigests } from './memory_history.js';
 import { raiseAlert } from './alert.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
+import { callAiCopy } from './ai_copy.js';
 
 const botRoot = process.cwd();
 
@@ -145,25 +146,90 @@ export function getBeijingInfo(date = new Date()) {
 }
 
 // callAiCopy 已移到 ai_copy.js，这里继续转出，兼容仍从 scheduler.js 导入的旧 tasks.js
-export { callAiCopy } from './ai_copy.js';
+export { callAiCopy };
 
-// 动态载入当前 Bot 的专属任务配置 (优先 tasks.js，向下兼容 schedules.js)
+// 动态载入当前 Bot 的专属任务配置 tasks.js。每轮都看一眼文件，改了就重新载入，
+// 智能体加的任务不用重启就生效。新内容载入失败（写坏了、写到一半）就继续用上一份能用的，同一版只报一次错、告警一次
 let cachedTasks = null;
-async function loadBotTasks() {
-  if (cachedTasks) return cachedTasks;
-  const schedulePath = fs.existsSync(path.join(botRoot, 'tasks.js'))
-    ? path.join(botRoot, 'tasks.js')
-    : path.join(botRoot, 'schedules.js');
-  if (fs.existsSync(schedulePath)) {
-    try {
-      const mod = await import(pathToFileURL(schedulePath).href + `?t=${Date.now()}`);
-      cachedTasks = mod.TASKS || mod.default || [];
-      return cachedTasks;
-    } catch (e) {
-      console.error(`[载入任务配置失败 (${path.basename(schedulePath)})]:`, e.message);
+let loadedVersion = null;
+let brokenVersion = null;
+// 运行中新加、改了时间的任务从什么时候起算数：监控据此不把"加上时已经过了点"的任务当成漏发
+const taskSince = new Map();
+const hhmm = (t) => `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`;
+const taskManifest = (tasks) => tasks.map((t) => ({
+  id: t.id, name: t.name, hour: t.hour, minute: t.minute, workdaysOnly: Boolean(t.workdaysOnly),
+  ...(taskSince.has(t.id) ? { since: taskSince.get(t.id) } : {}),
+}));
+
+// 任务表的基本检查：last_fired 按 id 记，id 重复会让其中一个永远不发
+function taskProblem(tasks) {
+  if (!Array.isArray(tasks)) return 'TASKS 不是数组';
+  const ids = new Set();
+  for (const [i, t] of tasks.entries()) {
+    const label = `第 ${i + 1} 个任务${typeof t?.id === 'string' && t.id ? `（${t.id}）` : ''}`;
+    if (typeof t?.id !== 'string' || !t.id) return `${label}缺少 id`;
+    if (ids.has(t.id)) return `${label}的 id 和前面的重复了`;
+    ids.add(t.id);
+    if (!Number.isInteger(t.hour) || t.hour < 0 || t.hour > 23 || !Number.isInteger(t.minute) || t.minute < 0 || t.minute > 59) {
+      return `${label}的时间不对（hour 要 0~23，minute 要 0~59）`;
     }
+    if (typeof t.generateCopy !== 'function') return `${label}缺少 generateCopy`;
   }
-  cachedTasks = [];
+  return '';
+}
+
+// 和上一份比，列出新增、去掉、改了时间的任务（写进日志）
+function noteTaskChanges(before, after) {
+  const was = new Map(before.map((t) => [t.id, t]));
+  const ids = new Set(after.map((t) => t.id));
+  const parts = [];
+  for (const t of after) {
+    const o = was.get(t.id);
+    if (o && hhmm(o) === hhmm(t) && Boolean(o.workdaysOnly) === Boolean(t.workdaysOnly)) continue;
+    taskSince.set(t.id, Date.now());
+    parts.push(o ? `「${t.name}」改到 ${hhmm(t)}${t.workdaysOnly ? '（工作日）' : ''}` : `新增 ${hhmm(t)}「${t.name}」`);
+  }
+  for (const t of before) {
+    if (ids.has(t.id)) continue;
+    taskSince.delete(t.id);
+    parts.push(`去掉「${t.name}」`);
+  }
+  return parts.join('，');
+}
+
+async function loadBotTasks() {
+  const schedulePath = path.join(botRoot, 'tasks.js');
+  let stat = null;
+  try { stat = fs.statSync(schedulePath); } catch {}
+  // 启动时没有任务文件：没有定时任务；运行中文件不见了：先按原来的跑
+  if (!stat) return (cachedTasks ||= []);
+  const version = `${stat.mtimeMs}:${stat.size}`;
+  if (cachedTasks && (version === loadedVersion || version === brokenVersion)) return cachedTasks;
+  const name = path.basename(schedulePath);
+  try {
+    const mod = await import(`${pathToFileURL(schedulePath).href}?t=${Date.now()}`);
+    const tasks = mod.TASKS || mod.default || [];
+    const problem = taskProblem(tasks);
+    if (problem) throw new Error(problem);
+    if (cachedTasks) {
+      const changes = noteTaskChanges(cachedTasks, tasks);
+      console.log(`[任务配置已重新载入]: ${name} 共 ${tasks.length} 个任务${changes ? `（${changes}）` : ''}`);
+    }
+    if (brokenVersion) {
+      console.log(`[任务配置已恢复]: ${name} 改好了`);
+      raiseAlert('tasks_config_ok', `${name} 改好了，按新的 ${tasks.length} 个任务执行`);
+    }
+    cachedTasks = tasks;
+    loadedVersion = version;
+    brokenVersion = null;
+  } catch (e) {
+    brokenVersion = version;
+    const reason = String(e.message).split('\n')[0].slice(0, 150);
+    const fallback = cachedTasks ? `先按上一份能用的 ${cachedTasks.length} 个任务执行` : '现在没有定时任务';
+    cachedTasks ||= [];
+    console.error(`[载入任务配置失败 (${name})]: ${reason}；${fallback}`);
+    raiseAlert('tasks_config_broken', `${name} 载入失败，${fallback}：${reason}`);
+  }
   return cachedTasks;
 }
 
@@ -271,30 +337,49 @@ async function checkDynamicReminders() {
   }
 }
 
+// 到点现写的提醒（ai: true）：content 写的是"要写什么"，到点让智能体现查现写；联网查资料常要一两分钟（环境变量仅供测试）
+const AI_REMINDER_TIMEOUT_MS = Number(process.env.AI_REMINDER_TIMEOUT_MS) || 180_000;
+async function aiReminderText(item, dueLabel, nick) {
+  const prompt = `现在是北京时间 ${dueLabel}。${nick}约好这个时间收到一条消息，要求是：${item.content}
+需要最新信息（比赛结果、新闻、行情、天气等）就先联网搜索核实，只写查到的事实；查不到的直接说没查到，绝不编造。
+直接输出要发给${nick}的内容，不要额外的客套话。`;
+  try {
+    return { text: await callAiCopy(prompt, { timeoutMs: AI_REMINDER_TIMEOUT_MS }), note: '（现写）' };
+  } catch {
+    // 具体原因 callAiCopy 已经记在日志里；写不出来就如实说，不把"要写什么"当成内容发出去
+    return {
+      text: `🔔 ${nick}，到点了：${item.content}\n（这条本来要到点现查现写，这次没写出来。回我一句，我马上现查。）`,
+      note: '（现写没成功，发了说明）',
+    };
+  }
+}
+
 async function deliverDueReminders() {
   const reminders = readReminders();
   if (!reminders || reminders.length === 0) return;
 
   const now = Date.now();
-  const remaining = [];
+  const remaining = []; // [原来的位置, 留下的条目]：写回时保持原来的顺序
   const config = loadConfig();
   let windowClosed = Boolean(replyWindow().closed_at);
 
-  for (const item of reminders) {
+  // 现写的提醒可能要等智能体一两分钟：同一轮到点的普通提醒先发
+  const order = reminders.map((item, i) => [i, item]).sort(([, a], [, b]) => Boolean(a.ai) - Boolean(b.ai));
+  for (const [i, item] of order) {
     if (item.target_time_ms && now >= item.target_time_ms) {
       // 安全隔离防护：如果指定了 user_id 但不是当前实例绑定的微信用户，则跳过不处理，防止串号
       if (item.user_id && config.authorized_user_id && item.user_id !== config.authorized_user_id) {
         console.warn(`[动态提醒隔离拦截]: 任务用户 ${item.user_id} 非本实例绑定用户 ${config.authorized_user_id}，跳过处理`);
-        remaining.push(item);
+        remaining.push([i, item]);
         continue;
       }
       // 微信窗口关着：先留着，等对方回消息后补发
       if (windowClosed) {
-        remaining.push({ ...item, held_by_window: true });
+        remaining.push([i, { ...item, held_by_window: true }]);
         continue;
       }
 
-      console.log(`\n⏰ [动态定时提醒到期触发]: ${describeText(item.content)}`);
+      console.log(`\n⏰ [动态定时提醒到期触发]: ${describeText(item.content)}${item.ai ? '（到点现写）' : ''}`);
       const toUser = config.authorized_user_id;
       // 优先用最新的 context_token：提醒创建时带的那个可能早就过期了
       const ctxToken = loadRuntimeState('forwarder').last_context_token || item.context_token;
@@ -306,18 +391,21 @@ async function deliverDueReminders() {
         const late = item.held_by_window
           ? `\n（这条提醒原本是 ${shortTime(item.target_time_ms)} 的，当时${userNickname}太久没发消息，微信不让${config.bot_name || '小助理'}主动发，现在补上。）`
           : '';
-        const nudge = withReplyNudge(`🔔 ${userNickname}，提醒到啦：${item.content}${late}`, config);
+        const body = item.ai
+          ? await aiReminderText(item, dueLabel, userNickname)
+          : { text: `🔔 ${userNickname}，提醒到啦：${item.content}`, note: '' };
+        const nudge = withReplyNudge(`${body.text}${late}`, config);
         try {
           await sendWechatReply(toUser, ctxToken, nudge.text, config);
-          appendLog(`[动态提醒下发成功]: ${item.content}`);
-          console.log(`✅ [动态提醒已发送微信]: ${describeText(nudge.text)}${late ? '（补发）' : ''}`);
+          appendLog(`[动态提醒下发成功]: ${item.ai ? body.text : item.content}`);
+          console.log(`✅ [动态提醒已发送微信]: ${describeText(nudge.text)}${late ? '（补发）' : ''}${body.note}`);
         } catch (e) {
           nudge.undo();
           if (isWindowClosedError(e)) {
             console.warn('[动态提醒未送达]: 微信窗口已关闭，先留着，对方回消息后补发');
             markReplyWindowClosed();
             windowClosed = true;
-            remaining.push({ ...item, held_by_window: true });
+            remaining.push([i, { ...item, held_by_window: true }]);
             continue;
           }
           console.error(`❌ [动态提醒发送失败]:`, e.message);
@@ -328,14 +416,14 @@ async function deliverDueReminders() {
         raiseAlert('reminder_failed', `一条 ${dueLabel} 的提醒没发出去：缺少授权用户或 context_token`);
       }
     } else {
-      remaining.push(item);
+      remaining.push([i, item]);
     }
   }
 
   // 写回前重新读一遍：发送期间智能体可能又追加了新提醒，这些要保留下来
   const seen = new Set(reminders.map((r) => JSON.stringify(r)));
   const added = (readReminders() || []).filter((r) => !seen.has(JSON.stringify(r)));
-  const next = [...remaining, ...added];
+  const next = [...remaining.sort((a, b) => a[0] - b[0]).map(([, r]) => r), ...added];
   if (JSON.stringify(next) !== JSON.stringify(reminders)) {
     try {
       writeJsonAtomic(REMINDERS_FILE, next);
@@ -639,11 +727,10 @@ async function startScheduler() {
   console.log(` • ${memoryNote}`);
   console.log(`====================================================\n`);
 
-  // 心跳 + 任务表：监控服务据此发现"调度器停了"和"定时任务到点没发"
-  const manifest = tasks.map((t) => ({ id: t.id, name: t.name, hour: t.hour, minute: t.minute, workdaysOnly: Boolean(t.workdaysOnly) }));
+  // 心跳 + 任务表：监控服务据此发现"调度器停了"和"定时任务到点没发"；任务表跟着 tasks.js 的重新载入更新
   const heartbeat = () => {
     try {
-      saveRuntimeState('scheduler', { heartbeat_at: Date.now(), tasks: manifest });
+      saveRuntimeState('scheduler', { heartbeat_at: Date.now(), tasks: taskManifest(cachedTasks || []) });
     } catch (e) {
       console.error('[调度心跳写入失败]:', e.message);
     }

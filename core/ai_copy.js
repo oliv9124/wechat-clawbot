@@ -7,8 +7,8 @@ const botRoot = process.cwd();
 const AI_COPY_TIMEOUT_MS = Number(process.env.AI_COPY_TIMEOUT_MS) || 90_000;
 
 // 定时播报文案生成，供各实例 tasks.js 导入（在调度器进程里运行）。
-// 单独成文件，是为了让 tasks.js 不再导入 scheduler.js 本身。
-export function callAiCopy(promptText) {
+// 单独成文件，是为了让 tasks.js 不再导入 scheduler.js 本身。要联网查资料的文案（赛果、新闻）可以给更长的 timeoutMs。
+export function callAiCopy(promptText, { timeoutMs = AI_COPY_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const config = loadConfig();
     const userNickname = config.user_nickname || '主人';
@@ -22,7 +22,7 @@ export function callAiCopy(promptText) {
       args,
       {
         cwd: botRoot,
-        timeout: AI_COPY_TIMEOUT_MS,
+        timeout: timeoutMs,
         env: process.env,
         maxBuffer: 5 * 1024 * 1024,
       },
@@ -30,7 +30,7 @@ export function callAiCopy(promptText) {
         const outcome = agyOutcome(err, stdout, stderr);
         recordAgentResult('scheduler', outcome);
         if (!outcome.ok) {
-          const reason = outcome.kind === 'timeout' ? `超过 ${Math.round(AI_COPY_TIMEOUT_MS / 1000)} 秒没完成` : outcome.reason;
+          const reason = outcome.kind === 'timeout' ? `超过 ${Math.round(timeoutMs / 1000)} 秒没完成` : outcome.reason;
           console.warn(`[AI 文案生成失败]: ${reason}，改用预设文案`);
           // 只给原因，不用 err.message（里面是完整命令行）
           return reject(new Error(`AI 文案生成失败：${reason}`));

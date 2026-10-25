@@ -40,6 +40,9 @@ const SEND_TIMEOUT_MS = env('MONITOR_SEND_TIMEOUT_MS', 30_000);
 const WINDOW_DEDUPE_MS = env('MONITOR_WINDOW_DEDUPE_MS', 24 * 3600_000); // "太久没发消息"一天最多提醒一次
 const AGENT_FAIL_STREAK = env('MONITOR_AGENT_FAIL_STREAK', 3); // 智能体除登录失效外，连续失败几次才报
 const AGENT_ERROR_KINDS = { timeout: '超时没完成', error: '调用出错' };
+// 程序代码没提交的改动持续多久才报：上线时从装好文件到提交，中间也有几分钟"有改动"
+const CODE_DIR = process.env.CLAWBOT_CODE_DIR || PROJECT_DIR;
+const CODE_DIRTY_AFTER_MS = env('MONITOR_CODE_DIRTY_AFTER_MS', 10 * 60_000);
 const SEND_MAIL = path.join(path.dirname(fileURLToPath(import.meta.url)), 'send_mail.py');
 const HAS_WARP = ['/usr/bin/warp-cli', '/usr/local/bin/warp-cli'].some((p) => fs.existsSync(p));
 const ROLES = { routine: '消息处理', forwarder: '消息接收', scheduler: '定时任务' };
@@ -141,6 +144,11 @@ const EVENTS = {
   memory_snapshot_failed: { key: 'memory_snapshot', event: true, title: '记忆历史存版本失败', advice: (b) => `记忆改动暂时没有存进历史，早间的"记忆变动"汇报和撤销可能不全。${logsOf('scheduler', b)}` },
   message_failed: { key: 'message_failed', event: true, title: '有消息没处理成功', advice: (b) => `失败的消息放在 ${b.dir}/data/inbox/failed/ ；${logsOf('routine', b)}` },
   reply_failed: { key: 'reply_failed', event: true, title: '有回复没发出去', advice: (b) => logsOf('routine', b) },
+  tasks_config_broken: {
+    key: 'tasks_config', sticky: true, title: '定时任务配置（tasks.js）写坏了',
+    advice: (b) => `改好 ${b.dir}/tasks.js 后约 10 秒自动生效，那时会再通知"已恢复"；${logsOf('scheduler', b)}`,
+  },
+  tasks_config_ok: { key: 'tasks_config', recovery: true, title: '定时任务配置（tasks.js）已恢复' },
   // 微信只允许机器人在对方最近一次发消息后约 24 小时内主动发消息；标题和建议里用实例自己的称呼
   user_window_closed: {
     key: 'user_window', sticky: true, dedupeMs: WINDOW_DEDUPE_MS,
@@ -152,13 +160,15 @@ const EVENTS = {
 
 // keys：每个问题的通知记录（有记录 = 已通知、还没恢复）；units：服务重启计数采样；retry：没发出去待重试的通知；
 // ownerWindowClosedFor / windowClosedFor[实例]：经这个机器人发微信被拒（窗口已关）时，它的用户最后一条消息的时间，
-// 用户再发消息之前不再走微信（统一管理时只有主人的机器人发，记在 ownerWindowClosedFor）
-let state = { keys: {}, units: {}, retry: [], ownerWindowClosedFor: null, windowClosedFor: {} };
+// 用户再发消息之前不再走微信（统一管理时只有主人的机器人发，记在 ownerWindowClosedFor）；
+// codeDirtySince：从什么时候起看到程序代码有没提交的改动
+let state = { keys: {}, units: {}, retry: [], ownerWindowClosedFor: null, windowClosedFor: {}, codeDirtySince: 0 };
 function loadState() {
   const s = readJson(STATE_FILE) || {};
   state = {
     keys: s.keys || {}, units: s.units || {}, retry: s.retry || [],
     ownerWindowClosedFor: s.ownerWindowClosedFor ?? null, windowClosedFor: s.windowClosedFor || {},
+    codeDirtySince: s.codeDirtySince || 0,
   };
 }
 
@@ -276,6 +286,8 @@ function checkBot(outgoing, bot, dedupeMs) {
     if (due === null) continue;
     const late = now - due;
     if (late < MISSED_AFTER_MS || late > MISSED_WINDOW_MS || fired[task.id] === today) continue;
+    // 运行中才加上（或改到这个时间）的任务，加上时已经过了点：今天本来就不会发，不算漏发
+    if (task.since && due < task.since) continue;
     const hhmm = `${String(task.hour).padStart(2, '0')}:${String(task.minute).padStart(2, '0')}`;
     notify(outgoing, `${bot.name}:task_missed:${task.id}:${today}`, {
       ...base, event: true, title: '定时任务到点没发', detail: `「${task.name}」（${hhmm}）过了 ${duration(late)}还没发出`,
@@ -284,7 +296,52 @@ function checkBot(outgoing, bot, dedupeMs) {
   }
 }
 
-function collect(outgoing, dedupeMs) {
+// 程序代码没提交的改动（git status）：机器人自己能改的 tasks.js、topics.json 不算；没被 git 跟踪的新文件只看程序目录
+// （机器人在自己目录里给用户做的东西不算）。GIT_OPTIONAL_LOCKS=0：只读，不刷新索引（服务的沙箱里程序目录是只读的）；
+// 沙箱里看不到 /root，HOME 指到一个不存在的目录，git 就不去读个人配置
+const BOT_EDITABLE = /^bots\/[^/]+\/(tasks\.js|topics\.json)$/;
+const PROGRAM_DIRS = /^(core|deploy|dist|scripts|skills|\.agents)\//;
+function uncommittedCode() {
+  const out = execFileSync('git', ['-c', 'core.quotePath=false', '-C', CODE_DIR, 'status', '--porcelain'], {
+    encoding: 'utf-8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', HOME: '/nonexistent', XDG_CONFIG_HOME: '/nonexistent' },
+  });
+  return out.split('\n').filter(Boolean)
+    .map((l) => ({ untracked: l.startsWith('??'), file: l.slice(3).replace(/^.* -> /, '').replace(/^"(.*)"$/, '$1') }))
+    .filter(({ untracked, file }) => (untracked ? PROGRAM_DIRS.test(file) : !BOT_EDITABLE.test(file)))
+    .map(({ file }) => file);
+}
+
+// 统一管理时才查（经主人的机器人告诉主人）：没提交的改动持续一段时间就报，改动提交或还原后报"已处理"
+function checkCode(outgoing, cfg, bots, dedupeMs) {
+  if (!cfg.owner_bot) return;
+  let files;
+  try {
+    files = uncommittedCode();
+  } catch (err) {
+    if (!state.codeCheckFailed) console.error('[监控] 查看程序代码改动失败:', String(err.stderr || err.message).trim().split('\n')[0]);
+    state.codeCheckFailed = true;
+    return;
+  }
+  state.codeCheckFailed = false;
+  const owner = bots.find((b) => b.name === cfg.owner_bot);
+  const base = { bot: cfg.owner_bot, botName: owner?.display || cfg.owner_bot };
+  const key = `${cfg.owner_bot}:code_changed`;
+  if (!files.length) {
+    state.codeDirtySince = 0;
+    notify(outgoing, key, { ...base, title: '程序代码的改动已经处理（提交或还原）了', recovery: true }, dedupeMs);
+    return;
+  }
+  state.codeDirtySince ||= Date.now();
+  if (Date.now() - state.codeDirtySince < CODE_DIRTY_AFTER_MS) return;
+  notify(outgoing, key, {
+    ...base, sticky: true, title: '程序代码有没提交的改动',
+    detail: `${beijingTime(state.codeDirtySince)} 起：${files.slice(0, 5).join('、')}${files.length > 5 ? ` 等 ${files.length} 个文件` : ''}`,
+    advice: `这些改动没经过测试。程序文件要等服务重启才会用上（规则文件 AGENTS.md 下一条消息就生效），所有机器人都受影响。看改了什么：cd ${CODE_DIR} && git diff ；不要就 git checkout -- <文件> 还原，要留就测试后再提交。`,
+  }, dedupeMs);
+}
+
+function collect(outgoing, dedupeMs, cfg = {}) {
   const bots = discoverBots();
   for (const bot of bots) {
     try {
@@ -292,6 +349,11 @@ function collect(outgoing, dedupeMs) {
     } catch (err) {
       console.error(`[监控] 检查 ${bot.name} 出错:`, err.message);
     }
+  }
+  try {
+    checkCode(outgoing, cfg, bots, dedupeMs);
+  } catch (err) {
+    console.error('[监控] 检查程序代码改动出错:', err.message);
   }
   const now = Date.now();
   const names = new Set(bots.map((b) => b.name));
@@ -379,7 +441,7 @@ async function tick() {
   const cfg = readJson(CONFIG_FILE) || {};
   const dedupeMs = env('MONITOR_DEDUPE_MS', (Number(cfg.dedupe_hours) || 6) * 3600_000);
   const outgoing = [];
-  collect(outgoing, dedupeMs);
+  collect(outgoing, dedupeMs, cfg);
   const queue = [...state.retry, ...outgoing.map((alert) => ({ alert, firstTriedAt: Date.now() }))];
   state.retry = queue;
   writeJsonAtomic(STATE_FILE, state);

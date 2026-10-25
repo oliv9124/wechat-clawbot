@@ -305,24 +305,152 @@ function diffItems(botRoot, from, to) {
   return items;
 }
 
+// 一行记忆常写成"标题：一句；一句；…"（cleanLine 已经去掉了 ** 和列表符号）。只改了其中几句时按句比较、
+// 只列改了的那几句：不然改前改后开头一样，汇报里根本看不出改了什么
+const splitKey = (line) => {
+  const m = String(line).match(/^([^：:]{1,30})[：:]\s*(.+)$/);
+  return m ? { key: m[1].trim(), body: m[2] } : { key: '', body: String(line) };
+};
+const sentencesOf = (text) => String(text).split(/(?<=[；;。！？!?])/).map((s) => s.trim()).filter(Boolean);
+const bare = (s) => s.replace(/[；;。！？!?，,\s]+$/, '');
+const charLen = (s) => [...String(s)].length;
+
+// 两组句子之间连续改动的地方，一块一块列出来：[{ del: [句], add: [句] }]（比较时不看句末标点）
+function sentenceBlocks(a, b) {
+  const x = a.map(bare);
+  const y = b.map(bare);
+  const lcs = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+  for (let i = x.length - 1; i >= 0; i--) {
+    for (let j = y.length - 1; j >= 0; j--) lcs[i][j] = x[i] === y[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+  }
+  const blocks = [];
+  let cur = null;
+  let i = 0;
+  let j = 0;
+  while (i < x.length || j < y.length) {
+    if (i < x.length && j < y.length && x[i] === y[j]) {
+      if (cur) blocks.push(cur);
+      cur = null;
+      i++;
+      j++;
+      continue;
+    }
+    cur ||= { del: [], add: [] };
+    if (j >= y.length || (i < x.length && lcs[i + 1][j] >= lcs[i][j + 1])) cur.del.push(a[i++]);
+    else cur.add.push(b[j++]);
+  }
+  if (cur) blocks.push(cur);
+  return blocks;
+}
+
+// 同一段里改前、改后的行配成对：标题相同的先配；剩下的行数一样就按顺序配，不一样就只配开头四个字相同的。
+// 配不上的整行算新增或删除
+function pairLines(del, add) {
+  const pairs = [];
+  const used = new Set();
+  const restDel = [];
+  for (const d of del) {
+    const k = splitKey(d).key;
+    const j = k ? add.findIndex((a, idx) => !used.has(idx) && splitKey(a).key === k) : -1;
+    if (j < 0) {
+      restDel.push(d);
+      continue;
+    }
+    used.add(j);
+    pairs.push([d, add[j]]);
+  }
+  let restAdd = add.filter((_, idx) => !used.has(idx));
+  if (restDel.length === restAdd.length) return { pairs: [...pairs, ...restDel.map((d, idx) => [d, restAdd[idx]])], dels: [], adds: [] };
+  const lead = (s) => [...s].slice(0, 4).join('');
+  const dels = [];
+  for (const d of restDel) {
+    const j = restAdd.findIndex((a) => lead(a) === lead(d));
+    if (j < 0) {
+      dels.push(d);
+      continue;
+    }
+    pairs.push([d, restAdd[j]]);
+    restAdd = restAdd.filter((_, idx) => idx !== j);
+  }
+  return { pairs, dels, adds: restAdd };
+}
+
+// 一对改前改后的行：两版标题相同就只比正文，返回 { key, blocks }
+function lineEdit(oldLine, newLine) {
+  const o = splitKey(oldLine);
+  const n = splitKey(newLine);
+  const key = o.key && o.key === n.key ? o.key : '';
+  return { key, blocks: key ? sentenceBlocks(sentencesOf(o.body), sentencesOf(n.body)) : sentenceBlocks(sentencesOf(oldLine), sentencesOf(newLine)) };
+}
+
+// 一句里改了几个字：放得下就整句列出；放不下就去掉前后相同的部分，各留几个字当上下文
+function replaceText(oldText, newText, max) {
+  if (charLen(oldText) <= max && charLen(newText) <= max) return `${oldText} → ${newText}`;
+  const a = [...oldText];
+  const b = [...newText];
+  let p = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let s = 0;
+  while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  const from = Math.max(0, p - 6);
+  const span = (c) => `${from > 0 ? '…' : ''}${c.slice(from, c.length - s + Math.min(s, 6)).join('')}${s > 6 ? '…' : ''}`;
+  return `${clip(span(a), max)} → ${clip(span(b), max)}`;
+}
+
+// 一处改动写成一句话：加了「…」、删了「…」或者 改前 → 改后
+function blockText(b, max) {
+  if (!b.del.length) return `加了「${clip(b.add.join(''), max)}」`;
+  if (!b.add.length) return `删了「${clip(b.del.join(''), max)}」`;
+  return replaceText(b.del.join(''), b.add.join(''), max);
+}
+
+// 汇报里的一条：类型、哪一项（行的标题）、改了什么、改了几行（只改一行时，这一行还有几处改动）
 function itemParts(item) {
   const add = visible(item.added);
   const del = visible(item.removed);
-  if (!del.length) return { kind: '新增', body: clip(add[0], 30), lines: add.length };
-  if (!add.length) return { kind: '删除', body: clip(del[0], 30), lines: del.length };
-  return { kind: '修改', body: `${clip(del[0], 14)} → ${clip(add[0], 14)}`, lines: Math.max(add.length, del.length) };
+  if (!del.length) return { kind: '新增', key: '', body: clip(add[0], 40), lines: add.length, more: 0 };
+  if (!add.length) return { kind: '删除', key: '', body: clip(del[0], 40), lines: del.length, more: 0 };
+  const lines = Math.max(add.length, del.length);
+  const { pairs, dels, adds } = pairLines(del, add);
+  const edits = pairs.map(([o, n]) => lineEdit(o, n)).filter((e) => e.blocks.length);
+  if (!edits.length) {
+    // 配上对的行只改了标点或空格：有整行增删的就列那一行
+    const body = adds.length ? `加了一行「${clip(adds[0], 30)}」` : dels.length ? `删了一行「${clip(dels[0], 30)}」` : '只改了标点或空格';
+    return { kind: '修改', key: '', body, lines, more: 0 };
+  }
+  const changes = edits.reduce((n, e) => n + e.blocks.length, 0) + dels.length + adds.length;
+  return { kind: '修改', key: edits[0].key, body: blockText(edits[0].blocks[0], 30), lines, more: changes - 1 };
 }
 
-// 给主人看的一行：编号、类型、文件、来源、内容
+const itemSuffix = ({ lines, more }) => (lines > 1 ? `（共 ${lines} 行）` : more > 0 ? `（这一行还有 ${more} 处改动）` : '');
+
+// 给主人看的一行：编号、类型、文件（和哪一项）、来源、内容
 function itemLine(item) {
-  const { kind, body, lines } = itemParts(item);
-  return `${item.n}. ${kind}｜${item.label}${item.source ? `（${item.source}）` : ''}：${body}${lines > 1 ? `（共 ${lines} 行）` : ''}`;
+  const p = itemParts(item);
+  return `${item.n}. ${p.kind}｜${item.label}${p.key ? `「${p.key}」` : ''}${item.source ? `（${item.source}）` : ''}：${p.body}${itemSuffix(p)}`;
 }
 
 // 给被代管实例的用户看的一行：不编号、不写来源
 function plainItemLine(item) {
-  const { kind, body, lines } = itemParts(item);
-  return `• ${kind}｜${item.label}：${body}${lines > 1 ? `（共 ${lines} 行）` : ''}`;
+  const p = itemParts(item);
+  return `• ${p.kind}｜${item.label}${p.key ? `「${p.key}」` : ''}：${p.body}${itemSuffix(p)}`;
+}
+
+// 「记忆改动」里一条的明细：短的行照旧整行列出改前改后；长的行（多半一行里写了好几句）只列改了的那几句
+function itemDetail(item) {
+  const { pairs, dels, adds } = pairLines(visible(item.removed), visible(item.added));
+  const out = [];
+  for (const [o, n] of pairs) {
+    if (charLen(o) <= 60 && charLen(n) <= 60) {
+      out.push(`   － ${o}`, `   ＋ ${n}`);
+      continue;
+    }
+    const { key, blocks } = lineEdit(o, n);
+    const where = key ? `「${key}」` : '';
+    if (!blocks.length) out.push(`   ✎ ${where}只改了标点或空格`);
+    for (const b of blocks) out.push(`   ✎ ${where}${blockText(b, 100)}`);
+  }
+  return [...out, ...dels.map((l) => `   － ${clip(l, 100)}`), ...adds.map((l) => `   ＋ ${clip(l, 100)}`)];
 }
 
 function sinceText(ms) {
@@ -448,10 +576,7 @@ export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot }) {
     let used = out[0].length;
     let shortFrom = null;
     for (const it of items) {
-      const detail = [
-        ...visible(it.removed).map((l) => `   － ${clip(l, 60)}`),
-        ...visible(it.added).map((l) => `   ＋ ${clip(l, 60)}`),
-      ];
+      const detail = itemDetail(it);
       const block = [itemLine(it).replace(/：.*$/, ''), ...detail.slice(0, 4)];
       if (detail.length > 4) block.push(`   …（共 ${detail.length} 行）`);
       const text = block.join('\n');
