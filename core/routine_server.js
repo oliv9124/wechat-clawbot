@@ -360,6 +360,16 @@ class PushRateLimiter {
     this.windowMs = 5 * 60 * 1000;
   }
 
+  isCoolingDown() {
+    const now = Date.now();
+    this.pushTimestamps = this.pushTimestamps.filter((t) => now - t < this.windowMs);
+    if (this.pushTimestamps.length >= this.maxPerWindow) {
+      const oldest = this.pushTimestamps[0];
+      return Math.max(0, Math.ceil((this.windowMs - (now - oldest) + 1500) / 1000));
+    }
+    return 0;
+  }
+
   async acquirePermission() {
     const now = Date.now();
     // 清理窗口外的历史时间戳
@@ -393,7 +403,7 @@ const activeBackgroundTasks = new Set();
 // 已经转入后台、还没跑完的任务：key → 这条消息开始处理的时间。期间问进度直接回，不再开一个新的智能体会话
 // （新会话看不到后台任务做到哪了，还要花一两分钟和十几万 tokens）
 const backgroundTasks = new Map();
-const STATUS_QUESTION = /^(咋样了?|怎么样了?|好了吗|好了没有?|好了么|好没好|进度(呢|如何|怎么样)?|还没好吗?|还要多久|要多久|多久|完成了吗|完成了没|弄好了吗|弄好了没|搞定了吗|搞定了没|搞定没|还在弄吗|到哪了|到哪一步了)[\s啊呀呢吧嘛哈～~。.!！?？…]*$/;
+const STATUS_QUESTION = /^(咋样了?|怎么样了?|好了吗|好了没有?|好了么|好没好|进度(呢|如何|怎么样)?|还没好吗?|还要多久|要多久|多久|完成了吗|完成了没|弄好了吗|弄好了没|搞定了吗|搞定了没|搞定没|还在弄吗|到哪了|到哪一步了|在吗|在不在|还在线吗|在线吗|人呢|还在吗|有在吗|你还在吗|人还在吗)[\s啊呀呢吧嘛哈～~。.!！?？…]*$/;
 
 // 同时最多运行的智能体数量（含转入后台的任务），超出的消息留在收件箱里排队
 const MAX_ACTIVE_AGENTS = 2;
@@ -441,6 +451,35 @@ let mainConversationGeneration = 0;
 const CONVERSATION_LOST_NOTICE = '（提示：原来的会话没能接上，已经开了一个新会话，之前聊过的细节可能记不全了。）';
 // 智能体登录失效时回给用户的话（监控会同时通知主人去重新登录）
 const agentLoginNotice = (botName) => `${botName}这会儿连不上智能体（登录失效了），已经通知去处理了，稍后再试哦～`;
+
+/**
+ * 人性化错误转译器：彻底屏蔽底层代码中的 exit 1、JSON、模型代号等技术黑话
+ */
+function formatFriendlyError(execErr, botName, userNickname) {
+  const msg = String(execErr?.message || execErr || '');
+  // 1. 服务拥堵 / 503 / 负载过高
+  if (/503|UNAVAILABLE|No capacity available|overloaded/i.test(msg)) {
+    return `${userNickname}，AI 模型服务器当前网络负载较高（正在排队），小助理的大脑正在稍作缓冲～请您稍等 1~2 分钟再发我试下～`;
+  }
+  // 2. 限流 / 429 / 频控
+  if (/429|RESOURCE_EXHAUSTED|rate limit|quota/i.test(msg)) {
+    return `${userNickname}，当前对话节奏较快，触发了保护频控～请给【${botName}】半分钟缓冲时间，马上恢复！`;
+  }
+  // 3. 超时 / 耗时过长
+  if (/stream idle timeout|context deadline exceeded|timeout|SIGTERM/i.test(msg)) {
+    return `${userNickname}，由于该任务内容较长，处理耗时超过了网络保护上限，稍候您可以精简一下内容或分段发我试下～`;
+  }
+  // 4. 微信窗口已关闭
+  if (/prepare failed/i.test(msg)) {
+    return `${userNickname}，微信消息窗口已休眠，请您在微信中回复任意文字即可重新激活对话～`;
+  }
+  // 5. 进程退出或通用错误（完全过滤掉 exit 1、JSON、模型代号）
+  if (/exit 1|exit [0-9]|status ERROR|Agent processing failed/i.test(msg)) {
+    return `${userNickname}，刚才处理这段内容时遇到了意外中断，【${botName}】已为您自动重置环境。您可以换个更简洁的问法随时发我重新处理～`;
+  }
+  // 6. 其他未知异常保底脱敏
+  return `${userNickname}，刚才的任务在后台处理遇到了临时波动，【${botName}】已自动调整完毕，您可以稍候重试～`;
+}
 
 // 自动发过的媒体：同一个文件（路径 + 修改时间 + 大小）1 小时内只自动发一次。后台任务的结果和接着问的一句常会提到同一个文件，
 // 不记一下就会发两遍。记在 data/state/sent_media.json（只存哈希，不存文件名），重启也不丢；用户明确要再发时照发
@@ -856,18 +895,27 @@ async function handleWechatTask(task) {
   const personaDesc = config.persona_description || `【${botName}】`;
   const forbiddenPrompt = config.forbidden_persona ? `严禁称呼用户为“${config.forbidden_persona}”。` : '';
 
-  // 后台任务还没跑完时问进度：直接回，不调用智能体
-  if (backgroundTasks.size > 0 && STATUS_QUESTION.test(message_text.trim())) {
-    const minutes = Math.max(1, Math.round((Date.now() - Math.min(...backgroundTasks.values())) / 60000));
-    const status = backgroundTasks.size > 1
-      ? `还有 ${backgroundTasks.size} 个任务在后台弄，最早的那个已经 ${minutes} 分钟了`
-      : `刚才那个任务还在后台弄，已经 ${minutes} 分钟了`;
-    const statusReply = `${userNickname}，${status}，好了${botName}马上发你～`;
-    console.log('[进度询问]: 还有任务在后台跑，直接回复进度，不调用智能体');
+  // 状态询问与流控防连击：流控冷却中或后台任务运行中，直接秒回，不调用智能体
+  const coolingSeconds = pushRateLimiter.isCoolingDown();
+  const hasBackground = backgroundTasks.size > 0;
+  if ((hasBackground || coolingSeconds > 0) && STATUS_QUESTION.test(message_text.trim())) {
+    let statusReply = '';
+    if (coolingSeconds > 5) {
+      statusReply = `${userNickname}，在的在的！刚才发送较快触发了微信防频控保护，正在安全冷却中（预计还需 ${coolingSeconds} 秒），解冻后结果马上给您送达～`;
+    } else if (hasBackground) {
+      const minutes = Math.max(1, Math.round((Date.now() - Math.min(...backgroundTasks.values())) / 60000));
+      const status = backgroundTasks.size > 1
+        ? `还有 ${backgroundTasks.size} 个任务在后台全力整理中，最早的那个已经进行约 ${minutes} 分钟了`
+        : `刚才那个任务还在后台全力整理中，已经进行约 ${minutes} 分钟了`;
+      statusReply = `${userNickname}，在的在的！${status}，好了【${botName}】马上发您～`;
+    } else {
+      statusReply = `${userNickname}，在的在的！【${botName}】时刻在线，随时准备为您效劳～`;
+    }
+    console.log('[状态询问]: 直接温和回复当前状态，不调用智能体');
     if (from_user_id && context_token) {
       await sendWechatReply(from_user_id, context_token, statusReply, config);
     }
-    appendLog(`AI回复(进度): ${statusReply}`);
+    appendLog(`AI回复(状态): ${statusReply}`);
     console.log(`====================================================\n`);
     return null;
   }
@@ -961,10 +1009,10 @@ async function handleWechatTask(task) {
     let rawReply = '';
     if (raceResult.err) {
       console.error('[runAgent 异常]:', raceResult.err.message);
-      // 登录失效时如实说明（监控已经通知主人），不再说成"网络波动"
+      // 登录失效时如实说明（监控已经通知主人）；其他错误使用友好转译器脱敏
       plainReply = raceResult.err.agentFailure === 'auth'
         ? agentLoginNotice(botName)
-        : '小助理刚才正在处理上一条重度任务或网络发生波动，未能及时响应，请稍候重试一下～';
+        : formatFriendlyError(raceResult.err, botName, userNickname);
     } else {
       rawReply = raceResult.res.reply;
       plainReply = rawReply;
@@ -1038,14 +1086,9 @@ async function handleWechatTask(task) {
           const toUser = latestConfig.authorized_user_id || from_user_id;
           const targetToken = loadRuntimeState('forwarder').last_context_token || context_token;
 
-          let friendlyReason = execErr.message || '未知异常';
-          if (friendlyReason.includes('timeout') || friendlyReason.includes('SIGTERM')) {
-            friendlyReason = '执行耗时超过系统最大保护上限 (10分钟)';
-          }
-
           const errorNotice = execErr.agentFailure === 'auth'
             ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`
-            : `🔔 【后台任务执行提醒】\n${userNickname}，刚才在后台处理的任务遇到异常中断：${friendlyReason}。稍候可精简任务内容后重试～`;
+            : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`;
           await deliverResultToWechat(toUser, targetToken, errorNotice, '', true, message_text);
         } catch (postErr) {
           console.error(`[后台异常通知发送失败]:`, postErr.message);
