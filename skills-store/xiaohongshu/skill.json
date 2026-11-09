@@ -1,0 +1,11 @@
+{
+  "name": "xiaohongshu",
+  "title": "小红书",
+  "version": "1.0.0",
+  "description": "小红书：搜索、看帖子和评论、热点跟踪（基于 xiaohongshu-mcp）",
+  "credential": { "label": "小红书", "required": true, "note": "要先登录小红书" },
+  "requires": { "commands": [], "python": [], "home_bin": ["xiaohongshu-mcp"] },
+  "uses": [],
+  "memory_mb": 400,
+  "sandbox": true
+}

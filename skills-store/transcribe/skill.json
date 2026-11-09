@@ -1,0 +1,11 @@
+{
+  "name": "transcribe",
+  "title": "转文字",
+  "version": "1.0.0",
+  "description": "把音频或视频转成逐字稿和要点（本地 Whisper，全服务器排队）",
+  "credential": null,
+  "requires": { "commands": ["ffmpeg"], "python": ["faster_whisper"], "whisper_model": "base" },
+  "uses": [],
+  "memory_mb": 900,
+  "sandbox": true
+}

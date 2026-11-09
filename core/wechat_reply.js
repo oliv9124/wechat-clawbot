@@ -59,8 +59,38 @@ function readJsonStrict(targetPath) {
   }
 }
 
+// 称呼和人设放在实例目录的 profile.json（机器人自己能改，下一条消息生效）；config.json 只放微信凭证和端口（只由扫码登录写入）。
+// 读配置时把 profile.json 里这几项盖到 config.json 上，凭证、端口这些 profile.json 改不了
+export const PROFILE_KEYS = ['bot_name', 'user_nickname', 'forbidden_persona', 'persona_description', 'reply_nudge_hours', 'digest_style'];
+
+function readProfile(configPath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(path.dirname(configPath), 'profile.json'), 'utf-8');
+  } catch {
+    return {};
+  }
+  try {
+    const obj = JSON.parse(raw) || {};
+    return Object.fromEntries(PROFILE_KEYS.filter((k) => obj[k] !== undefined && obj[k] !== null).map((k) => [k, obj[k]]));
+  } catch (err) {
+    console.warn(`[profile.json] 不是合法的 JSON，这次按 config.json 里的称呼和人设：${err.message}`);
+    return {};
+  }
+}
+
 export function loadConfig(customPath = null) {
-  return readJsonStrict(getConfigPath(customPath));
+  const p = getConfigPath(customPath);
+  return { ...readJsonStrict(p), ...readProfile(p) };
+}
+
+/** 某个实例目录的配置（含 profile.json）；读不到返回 {}。给监控、管理服务这些要看别的实例的地方用 */
+export function loadBotSettings(botDir) {
+  try {
+    return loadConfig(path.join(botDir, 'config.json'));
+  } catch {
+    return {};
+  }
 }
 
 // config.json 只放静态配置与凭证，只应由扫码登录（login.js）写入；运行中变化的数据请用 saveRuntimeState

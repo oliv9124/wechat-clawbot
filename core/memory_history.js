@@ -1,16 +1,17 @@
 /**
- * 记忆历史：给机器人的记忆文件（MEMORY.md、data/memory/topics/*.md）存版本、生成"记忆变动"汇报、按条撤销。
+ * 版本记录：给机器人目录里的记忆（MEMORY.md、data/memory/）和设置（tasks.js、topics.json、profile.json、
+ * .agents/ 里自己的技能和规则、scripts/）存版本，生成早间的"改动"汇报，按条撤销。
  *
- * 每个实例一个 git 库 <历史目录>/<实例>/，里面是记忆文件的副本；线上文件只在撤销、恢复时才会被写回。
- * 两种用法（memoryMode 决定）：
+ * 每个实例一个 git 库 <历史目录>/<实例>/，里面是这些文件的副本；线上文件只在撤销、恢复时才会被写回。
+ * 用法（memoryMode 决定）：
+ *   managed：由管理服务（core/manager.js，clawbot-manager.service，root）统一管。历史在只有 root 能读写的
+ *     /var/lib/clawbot/memory-history；管理服务替每个实例把待发的汇报写进它自己的目录，处理它转来的管理指令，
+ *     直接经它的微信回复。管理员（告警配置里 owner_bot 那个实例的用户）还能看、能撤销别的实例的改动。
  *   standalone（默认）：每个实例自己管自己。历史存在实例自己的 data/memory-history/，
- *     它的调度器存版本、早间播报附上自己的"记忆变动"，消息处理认「记忆改动」「撤销记忆 N」。
- *   owner + managed（一台机器上由一个主人的机器人统一管）：主人的机器人（/etc/clawbot/alert.json 的 owner_bot，
- *     以 root 运行）把所有实例的历史存在只有 root 能读写的 /var/lib/clawbot/memory-history，
- *     早间播报附上自己的"记忆变动"，「X记忆改动」可以专门看别的实例；沙箱里被代管的实例（managed）
- *     读不到历史，主人的机器人替它把汇报写进它自己的目录，它的早间播报附上（不编号、不能撤销）。
- * 汇报列到哪一版、最近一份清单的编号，记在 <历史目录>/review.json（只记版本号，不记内容）。
- * 日志和提交说明里只有实例名、文件名和条数，不写记忆内容。
+ *     它的调度器存版本、早间播报附上自己的"改动"，消息处理认「记忆改动」「撤销 N」。
+ *   owner：旧的统一管理方式（主人的机器人以 root 运行，在自己的进程里管所有实例），已由管理服务取代，只为兼容保留。
+ * 汇报列到哪一版、每个人最近一份清单的编号，记在 <历史目录>/review.json（只记版本号，不记内容）。
+ * 日志和提交说明里只有实例名、文件名和条数，不写内容。以 root 读写机器人目录时不跟着软链接走（见 insideBot）。
  *
  * 命令行：
  *   node memory_history.js log <实例>                       版本列表
@@ -24,7 +25,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { listMemoryFiles, memoryLabel, charCount } from './memory_config.js';
-import { writeJsonAtomic } from './wechat_reply.js';
+import { writeJsonAtomic, loadBotSettings } from './wechat_reply.js';
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // 告警配置：服务器上统一放 /etc/clawbot/alert.json；没有就用项目目录下的 alert.json
@@ -68,18 +69,19 @@ function gitAvailable() {
 }
 
 /**
- * 这个实例的记忆历史怎么管：
- *   owner      主人的机器人（root，并且是告警配置里的 owner_bot）：管这台机器上所有实例
- *   managed    服务配置里设了 CLAWBOT_MEMORY_MODE=managed：由主人的机器人代管，只附它准备好的汇报
+ * 这个实例的版本记录怎么管：
+ *   managed    服务配置里设了 CLAWBOT_MEMORY_MODE=managed（服务模板里都设了）：由管理服务统一管，
+ *              早间播报附上它准备好的汇报，管理指令转给它处理
  *   standalone 默认：自己管自己
- *   off        设了 CLAWBOT_MEMORY_MODE=off，或者没装 git：不存记忆历史
+ *   owner      旧的统一管理方式：主人的机器人以 root 运行、又没写明模式时，在自己的进程里管所有实例（只为兼容保留）
+ *   off        设了 CLAWBOT_MEMORY_MODE=off，或者没装 git：不存版本
  */
 export function memoryMode(botRoot) {
+  const forced = process.env.CLAWBOT_MEMORY_MODE;
+  if (forced === 'managed' || forced === 'off') return forced;
   try {
     if (process.getuid?.() === 0 && ownerBotName() === path.basename(botRoot)) return 'owner';
   } catch {}
-  const forced = process.env.CLAWBOT_MEMORY_MODE;
-  if (forced === 'managed' || forced === 'off') return forced;
   return gitAvailable() ? 'standalone' : 'off';
 }
 
@@ -171,26 +173,137 @@ export function discoverBots(botsDir = DEFAULT_BOTS_DIR) {
     .map((n) => path.join(botsDir, n));
 }
 
-const displayName = (botRoot) => readJson(path.join(botRoot, 'config.json'))?.bot_name || path.basename(botRoot);
+const displayName = (botRoot) => loadBotSettings(botRoot).bot_name || path.basename(botRoot);
+
+
+// ---------- 以 root 读写机器人目录 ----------
+// 不跟着软链接走：不然沙箱里的机器人放一个指向 /etc/shadow 或别的机器人目录的链接，就能借 root 替它读出来、写进去。
+// 路径上每一段都得是这个目录里真实的文件夹（还不存在的会新建，也是真实的），最后一段读的时候不能是软链接
+export function insideBot(botRoot, abs) {
+  const rel = path.relative(botRoot, abs);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  let cur = botRoot;
+  for (const part of rel.split(path.sep).slice(0, -1)) {
+    cur = path.join(cur, part);
+    let st;
+    try { st = fs.lstatSync(cur); } catch { return true; }
+    if (!st.isDirectory()) return false;
+  }
+  try {
+    const rootReal = fs.realpathSync(botRoot);
+    const parent = fs.realpathSync(path.dirname(abs));
+    return parent === rootReal || parent.startsWith(rootReal + path.sep);
+  } catch {
+    return true;
+  }
+}
+
+export function readBotFile(botRoot, abs) {
+  if (!insideBot(botRoot, abs)) throw new Error('路径经过软链接，不读');
+  const fd = fs.openSync(abs, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try { return fs.readFileSync(fd); } finally { fs.closeSync(fd); }
+}
+
+// ---------- 设置文件 ----------
+// 除了记忆，机器人目录里它自己的设置也存版本：定时任务、专题设置、称呼和人设、自己的技能和规则（.agents/）、脚本（scripts/）。
+// .venv、下载、日志、运行状态不存；超过 200KB 或者不是文本的文件不存；软链接（比如装上的官方技能）只记它指向哪里
+const SETTING_FILES = ['tasks.js', 'topics.json', 'profile.json'];
+const SETTING_DIRS = ['.agents', 'scripts'];
+const SKIP_DIRS = new Set(['.venv', 'venv', 'node_modules', '__pycache__', '.git', '.cache']);
+const SETTING_MAX_BYTES = 200 * 1024;
+const SETTING_MAX_FILES = 500;
+const isMemoryRel = (rel) => rel === 'MEMORY.md' || rel.startsWith('data/memory/');
+
+/** 要存版本的设置文件：[{ rel, abs, buf }]，软链接是 [{ rel, abs, link }] */
+export function listSettingFiles(botRoot) {
+  const out = [];
+  const add = (rel) => {
+    if (out.length >= SETTING_MAX_FILES) return;
+    const abs = path.join(botRoot, rel);
+    let st;
+    try { st = fs.lstatSync(abs); } catch { return; }
+    if (st.isSymbolicLink()) {
+      try { out.push({ rel, abs, link: fs.readlinkSync(abs) }); } catch {}
+      return;
+    }
+    if (!st.isFile() || st.size > SETTING_MAX_BYTES) return;
+    let buf;
+    try { buf = readBotFile(botRoot, abs); } catch { return; }
+    if (!buf.subarray(0, 8192).includes(0)) out.push({ rel, abs, buf });
+  };
+  for (const f of SETTING_FILES) add(f);
+  const walk = (relDir) => {
+    const abs = path.join(botRoot, relDir);
+    try { if (!fs.lstatSync(abs).isDirectory()) return; } catch { return; }
+    let entries = [];
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const rel = `${relDir}/${e.name}`;
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) walk(rel);
+      } else {
+        add(rel);
+      }
+    }
+  };
+  for (const d of SETTING_DIRS) walk(d);
+  return out;
+}
+
+// 设置开始存版本时（第一次见到这个实例、或者刚升级到会存设置的版本）打上标签 settings-base：
+// 汇报和清单只列这之后的设置改动，已有的设置不当成"新增"
+const SETTINGS_BASE = 'settings-base';
+const settingsBase = (repo) => git(repo, ['rev-parse', '--verify', '-q', `refs/tags/${SETTINGS_BASE}^{commit}`], { allowFail: true })?.trim() || null;
+const isAncestor = (repo, a, b) => git(repo, ['merge-base', '--is-ancestor', a, b], { allowFail: true }) !== null;
+
+// 已经有记忆历史、还没有"设置的起点"的（升级上来的）：现有的设置单独存一版"设置的起点"。
+// 新实例不在这里：它的第一版记忆和设置一起存，就从那一版算起（见 snapshotBot）
+function ensureSettingsBase(botRoot, repo) {
+  if (settingsBase(repo)) return;
+  if (syncToRepo(botRoot, repo, { only: 'settings' })) git(repo, ['commit', '-q', '-m', '设置的起点']);
+  git(repo, ['tag', SETTINGS_BASE]);
+}
+
+// 刚改过（2 分钟内）的设置文件这一轮先不存，等它停下来：智能体可能分几次写同一个文件
+const settingTooFresh = (botRoot, rel, now) => {
+  try { return now - fs.lstatSync(path.join(botRoot, rel)).mtimeMs < STABLE_MS; } catch { return false; }
+};
 
 // ---------- 存版本 ----------
-// 把线上的记忆文件同步进历史库的工作区并暂存；返回有没有变化
-function syncToRepo(botRoot, repo) {
+// 把线上的记忆和设置文件同步进历史库的工作区并暂存；返回有没有变化。only：只同步 'memory' 或 'settings' 这一类，另一类原样不动；
+// skip(rel) 为真的设置文件这一轮原样不动（刚改过、还没停下来）
+function syncToRepo(botRoot, repo, { only = null, skip = null } = {}) {
   const want = new Map();
-  for (const f of listMemoryFiles(botRoot)) {
-    try { want.set(f.rel, fs.readFileSync(f.abs)); } catch {}
+  if (only !== 'settings') {
+    for (const f of listMemoryFiles(botRoot)) {
+      try { want.set(f.rel, { buf: readBotFile(botRoot, f.abs) }); } catch {}
+    }
   }
+  if (only !== 'memory') {
+    for (const f of listSettingFiles(botRoot)) {
+      if (!skip?.(f.rel)) want.set(f.rel, f.link !== undefined ? { link: f.link } : { buf: f.buf });
+    }
+  }
+  const untouched = (rel) => (only === 'memory' && !isMemoryRel(rel)) || (only === 'settings' && isMemoryRel(rel))
+    || (!isMemoryRel(rel) && Boolean(skip?.(rel)));
   for (const rel of git(repo, ['ls-files']).split('\n').filter(Boolean)) {
-    if (!want.has(rel)) fs.rmSync(path.join(repo, rel), { force: true });
+    if (!want.has(rel) && !untouched(rel)) fs.rmSync(path.join(repo, rel), { force: true });
   }
-  for (const [rel, buf] of want) {
+  const repoReal = fs.realpathSync(repo);
+  for (const [rel, f] of want) {
     const dst = path.join(repo, rel);
     let same = false;
-    try { same = fs.readFileSync(dst).equals(buf); } catch {}
-    if (!same) {
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.writeFileSync(dst, buf, { mode: 0o600 });
-    }
+    try {
+      const st = fs.lstatSync(dst);
+      same = f.link !== undefined ? st.isSymbolicLink() && fs.readlinkSync(dst) === f.link : st.isFile() && fs.readFileSync(dst).equals(f.buf);
+    } catch {}
+    if (same) continue;
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    const parent = fs.realpathSync(path.dirname(dst));
+    if (parent !== repoReal && !parent.startsWith(repoReal + path.sep)) continue;
+    fs.rmSync(dst, { force: true, recursive: true });
+    if (f.link !== undefined) fs.symlinkSync(f.link, dst);
+    else fs.writeFileSync(dst, f.buf, { mode: 0o600 });
   }
   git(repo, ['add', '-A']);
   return git(repo, ['status', '--porcelain']).trim() !== '';
@@ -213,9 +326,14 @@ function snapshotSource(botRoot, now) {
 function snapshotBot(botRoot, { force = false, source = null, now = Date.now() } = {}) {
   if (!force && recentlyModified(botRoot, now)) return null;
   const repo = ensureRepo(path.basename(botRoot));
-  if (!syncToRepo(botRoot, repo)) return null;
-  git(repo, ['commit', '-q', '-m', source || snapshotSource(botRoot, now)]);
-  return head(repo);
+  // 新实例：第一版连同现有的设置一起存，打上"设置的起点"；升级上来的：先把现有的设置单独存一版
+  const fresh = !settingsBase(repo) && git(repo, ['rev-list', '--count', 'HEAD']).trim() === '1';
+  if (!fresh) ensureSettingsBase(botRoot, repo);
+  const skip = force || fresh ? null : (rel) => settingTooFresh(botRoot, rel, now);
+  const changed = syncToRepo(botRoot, repo, { skip });
+  if (changed) git(repo, ['commit', '-q', '-m', source || snapshotSource(botRoot, now)]);
+  if (fresh) git(repo, ['tag', SETTINGS_BASE]);
+  return changed ? head(repo) : null;
 }
 
 function snapshotAllUnlocked(botsDir, opts = {}) {
@@ -290,6 +408,7 @@ function diffItems(botRoot, from, to) {
   };
   const items = [];
   for (const rel of git(repo, ['diff', '--name-only', from, to]).split('\n').filter(Boolean)) {
+    if (!isMemoryRel(rel)) continue;
     const { hunks } = parsePatch(filePatch(repo, from, to, rel));
     const commits = git(repo, ['rev-list', '--reverse', `${from}..${to}`, '--', rel]).split('\n').filter(Boolean);
     hunks.forEach((h, i) => {
@@ -302,7 +421,84 @@ function diffItems(botRoot, from, to) {
       items.push({ bot, rel, from, to, hunk: i, label: memoryLabel(botRoot, rel), added, removed, source: c ? subjectOf(repo, c) : '' });
     });
   }
-  return items;
+  return [...items, ...settingItems(botRoot, from, to)];
+}
+
+// ---------- 设置的改动 ----------
+// 设置按"项"汇报：自己的一个技能（.agents/skills/<名字>/ 下的全部文件）、scripts/ 下的一个文件或文件夹各算一项，其他每个文件各算一项
+const settingGroup = (rel) => rel.match(/^(\.agents\/skills\/[^/]+|scripts\/[^/]+)/)?.[1] || rel;
+
+function settingLabel(group) {
+  const fixed = { 'tasks.js': '定时任务', 'topics.json': '专题设置', 'profile.json': '称呼和人设', '.agents/skills.json': '技能设置' };
+  if (fixed[group]) return fixed[group];
+  let m = group.match(/^\.agents\/skills\/(.+)$/);
+  if (m) return `技能 ${m[1]}`;
+  m = group.match(/^\.agents\/rules\/(.+?)(?:\.md)?$/);
+  if (m) return `规则 ${m[1]}`;
+  m = group.match(/^scripts\/(.+)$/);
+  return m ? `脚本 ${m[1]}` : group;
+}
+
+const treeMode = (repo, c, rel) => (git(repo, ['ls-tree', c, '--', rel], { allowFail: true }) || '').split(/\s/)[0] || null;
+
+/**
+ * from..to 之间设置的改动，一项一条：{ kind: 'setting', bot, rel（这一项的路径）, files, from, to, label, change, added, removed, link, source }。
+ * "设置的起点"之前的不算：起点更早就从"设置的起点"开始比
+ */
+function settingItems(botRoot, from, to) {
+  const bot = path.basename(botRoot);
+  const repo = repoDir(bot);
+  const base = settingsBase(repo);
+  if (!base || !isCommit(repo, from)) return [];
+  const start = isAncestor(repo, from, base) ? base : from;
+  if (start === to) return [];
+  const groups = new Map();
+  for (const line of git(repo, ['diff', '--no-renames', '--name-status', start, to]).split('\n').filter(Boolean)) {
+    const [status, rel] = line.split('\t');
+    if (!rel || isMemoryRel(rel)) continue;
+    const key = settingGroup(rel);
+    if (!groups.has(key)) groups.set(key, { files: [], statuses: new Set(), added: 0, removed: 0 });
+    groups.get(key).files.push(rel);
+    groups.get(key).statuses.add(status[0]);
+  }
+  for (const line of git(repo, ['diff', '--no-renames', '--numstat', start, to]).split('\n').filter(Boolean)) {
+    const [a, d, rel] = line.split('\t');
+    const g = rel && !isMemoryRel(rel) ? groups.get(settingGroup(rel)) : null;
+    if (g) {
+      g.added += Number(a) || 0;
+      g.removed += Number(d) || 0;
+    }
+  }
+  return [...groups].map(([rel, g]) => {
+    const change = g.statuses.size === 1 && g.statuses.has('A') ? '新增' : g.statuses.size === 1 && g.statuses.has('D') ? '删除' : '修改';
+    const link = g.files.length === 1 && treeMode(repo, change === '删除' ? start : to, g.files[0]) === '120000';
+    const source = git(repo, ['log', '-1', '--format=%s', `${start}..${to}`, '--', ...g.files], { allowFail: true })?.trim() || '';
+    return { kind: 'setting', bot, rel, files: g.files, from: start, to, label: settingLabel(rel), change, added: g.added, removed: g.removed, link, source };
+  });
+}
+
+function settingLine(it) {
+  const lines = [it.added ? `+${it.added}` : '', it.removed ? `−${it.removed}` : ''].filter(Boolean).join(' ');
+  const what = it.link
+    ? (it.change === '删除' ? '卸掉了官方技能' : '装上了官方技能')
+    : [it.files.length > 1 ? `${it.files.length} 个文件` : '', lines ? `${lines} 行` : ''].filter(Boolean).join('，');
+  return `${it.n}. ${it.change}｜${it.label}${it.source ? `（${it.source}）` : ''}：${what || '有改动'}`;
+}
+
+// 清单里设置那几条的细节：改了的那几行（每行最多 60 字）
+function settingDetail(it) {
+  const repo = repoDir(it.bot);
+  const out = [];
+  for (const rel of it.files || []) {
+    const patch = git(repo, ['diff', '--no-color', '--no-ext-diff', '-U0', it.from, it.to, '--', rel], { allowFail: true }) || '';
+    for (const l of patch.split('\n')) {
+      if ((l.startsWith('+') && !l.startsWith('+++')) || (l.startsWith('-') && !l.startsWith('---'))) {
+        const text = l.slice(1).trim();
+        if (text) out.push(`   ${l[0] === '+' ? '＋' : '－'} ${clip(text, 60)}`);
+      }
+    }
+  }
+  return out;
 }
 
 // 一行记忆常写成"标题：一句；一句；…"（cleanLine 已经去掉了 ** 和列表符号）。只改了其中几句时按句比较、
@@ -508,13 +704,46 @@ function overLimitNotes(botRoot) {
   for (const f of listMemoryFiles(botRoot)) {
     let n = 0;
     try { n = charCount(fs.readFileSync(f.abs, 'utf-8')); } catch { continue; }
-    if (n > f.max) notes.push(`⚠️ ${displayName(botRoot)}的「${f.label}」${n} 字，超过上限 ${f.max} 字，下次凌晨整理时会合并精简。`);
+    if (n > f.max) notes.push(`⚠️ ${displayName(botRoot)}的「${f.label}」${n} 字，超过上限 ${f.max} 字。${f.rel === 'MEMORY.md' ? '凌晨整理会把能归到专题的整条细节挪过去，' : '照常整份带上（超过两倍才截断），'}不会为了省字删内容。`);
   }
   return notes;
 }
 
 // 存进 review.json 的清单只留定位用的字段，不存内容
-const storedItem = ({ n, bot, rel, from, to, hunk, label, botName }) => ({ n, bot, rel, from, to, hunk, label, botName });
+const storedItem = ({ n, bot, rel, from, to, hunk, label, botName, kind, files }) => ({ n, bot, rel, from, to, hunk, label, botName, kind, files });
+const lineOf = (it) => (it.kind === 'setting' ? settingLine(it) : itemLine(it));
+const detailOf = (it) => (it.kind === 'setting' ? settingDetail(it) : itemDetail(it));
+
+// 带编号的汇报：记忆在前、设置在后，编号接着排；notes 附在后面（超长提醒、别的机器人有设置变动）
+function numberedDigestText(items, since, notes = []) {
+  const mem = items.filter((i) => i.kind !== 'setting');
+  const set = items.filter((i) => i.kind === 'setting');
+  const lines = [];
+  if (mem.length) {
+    lines.push(`📝 记忆变动（${sinceText(since)} 以来）`, ...mem.slice(0, DIGEST_MAX_ITEMS).map(itemLine));
+    if (mem.length > DIGEST_MAX_ITEMS) lines.push(`还有 ${mem.length - DIGEST_MAX_ITEMS} 条，回「记忆改动」看全部。`);
+  }
+  if (set.length) {
+    lines.push(mem.length ? '🛠 设置变动' : `🛠 设置变动（${sinceText(since)} 以来）`, ...set.slice(0, DIGEST_MAX_ITEMS).map(settingLine));
+    if (set.length > DIGEST_MAX_ITEMS) lines.push(`还有 ${set.length - DIGEST_MAX_ITEMS} 条，回「记忆改动」看全部。`);
+  }
+  lines.push(...notes);
+  if (items.length) {
+    const cmd = set.length ? '撤销' : '撤销记忆';
+    lines.push(items.length > DIGEST_MAX_ITEMS
+      ? `回「${cmd} 1」撤销第 1 条，「${cmd} 全部」撤销全部 ${items.length} 条。`
+      : `回「${cmd} 1」撤销第 1 条，「${cmd} 全部」全部撤销，「记忆改动」看完整内容。`);
+  }
+  return lines.join('\n');
+}
+
+// 「撤销 N」按谁最近看到的那份清单：shown_by[谁]；shown 是旧的写法（主人模式、独立模式），一起留着
+function setShown(state, viewer, items) {
+  const entry = { at: Date.now(), items };
+  state.shown_by = { ...state.shown_by, [viewer]: entry };
+  if (viewer === ownerBotName() || viewer === settings.only) state.shown = entry;
+}
+const shownFor = (state, viewer) => state.shown_by?.[viewer] || (viewer === ownerBotName() || viewer === settings.only ? state.shown : null);
 
 function recordDelivered(state, bot, range, at) {
   state.reported = { ...state.reported, [bot]: range.to };
@@ -535,13 +764,7 @@ export function buildDigest({ botsDir = DEFAULT_BOTS_DIR, bot }) {
     const { items, range } = botItems(botRoot, state.reported?.[bot]);
     if (!items.length) return null;
     const since = state.reported_at?.[bot] || commitTime(repoDir(bot), range.from);
-    const lines = [`📝 记忆变动（${sinceText(since)} 以来）`, ...items.slice(0, DIGEST_MAX_ITEMS).map(itemLine)];
-    if (items.length > DIGEST_MAX_ITEMS) lines.push(`还有 ${items.length - DIGEST_MAX_ITEMS} 条，回「记忆改动」看全部。`);
-    lines.push(...overLimitNotes(botRoot));
-    lines.push(items.length > DIGEST_MAX_ITEMS
-      ? `回「撤销记忆 1」撤销第 1 条，「撤销记忆 全部」撤销全部 ${items.length} 条。`
-      : '回「撤销记忆 1」撤销第 1 条，「撤销记忆 全部」全部撤销，「记忆改动」看完整内容。');
-    return { bot, text: lines.join('\n'), items: items.map(storedItem), range };
+    return { bot, text: numberedDigestText(items, since, overLimitNotes(botRoot)), items: items.map(storedItem), range };
   });
 }
 
@@ -549,8 +772,7 @@ export function markDigestDelivered(digest) {
   withLock(() => {
     const state = loadReview();
     recordDelivered(state, digest.bot, digest.range, Date.now());
-    // 主人的「撤销记忆 N」按这份汇报的编号
-    state.shown = { at: Date.now(), items: digest.items };
+    setShown(state, digest.bot, digest.items);
     saveReview(state);
   });
 }
@@ -559,25 +781,30 @@ export function markDigestDelivered(digest) {
  * 「记忆改动」「X记忆改动」：一个实例从最近一份早间汇报的起点到现在的全部改动（含汇报之后新的改动），
  * 带编号，主人接着回「撤销记忆 N」就按这份的编号撤。
  */
-export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot }) {
+export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot, viewer = null }) {
   return withLock(() => {
     snapshotAllUnlocked(botsDir, { force: true });
     const botRoot = findBot(botsDir, bot);
     const state = loadReview();
     initReported(botsDir, state);
+    const who = viewer || settings.only || ownerBotName() || bot;
     const last = state.last_digest?.[bot];
     const { items, range } = botItems(botRoot, last?.from || state.reported?.[bot]);
-    state.shown = { at: Date.now(), items: items.map(storedItem) };
+    setShown(state, who, items.map(storedItem));
+    // 管理员看过别的机器人的改动，早间汇报就不再提醒"它有几处设置变动"
+    if (who !== bot) state.pointed = { ...state.pointed, [bot]: range.to };
     saveReview(state);
-    const whose = bot === ownerBotName() || bot === settings.only ? '' : `${displayName(botRoot)}的`;
+    const whose = bot === who ? '' : `${displayName(botRoot)}的`;
     if (!items.length) return `最近一份汇报以来，${whose}记忆没有变化（或者改动都已经撤销了）。`;
+    const cmd = items.some((i) => i.kind === 'setting') ? '撤销' : '撤销记忆';
     const since = last?.from ? last.at : state.reported_at?.[bot] || commitTime(repoDir(bot), range.from);
-    const out = [`📝 ${whose}记忆改动（${sinceText(since)} 以来，共 ${items.length} 条）`];
+    const out = [`📝 ${whose}${cmd === '撤销' ? '' : '记忆'}改动（${sinceText(since)} 以来，共 ${items.length} 条）`];
     let used = out[0].length;
     let shortFrom = null;
     for (const it of items) {
-      const detail = itemDetail(it);
-      const block = [itemLine(it).replace(/：.*$/, ''), ...detail.slice(0, 4)];
+      const detail = detailOf(it);
+      // 记忆那几条的摘要就是下面的细节，标题里去掉；设置的摘要（改了几行、装上了官方技能）留着
+      const block = [it.kind === 'setting' ? settingLine(it) : itemLine(it).replace(/：.*$/, ''), ...detail.slice(0, 4)];
       if (detail.length > 4) block.push(`   …（共 ${detail.length} 行）`);
       const text = block.join('\n');
       if (used + text.length > LIST_MAX_CHARS) {
@@ -590,9 +817,9 @@ export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot }) {
     if (shortFrom) {
       // 放不下了：后面的只列一行摘要
       for (const it of items.slice(shortFrom - 1)) {
-        const line = itemLine(it);
+        const line = lineOf(it);
         if (used + line.length > LIST_MAX_CHARS + 600) {
-          out.push(`……后面还有 ${items.length - it.n + 1} 条没列出来，「撤销记忆 全部」也会撤销它们。`);
+          out.push(`……后面还有 ${items.length - it.n + 1} 条没列出来，「${cmd} 全部」也会撤销它们。`);
           break;
         }
         out.push(line);
@@ -600,7 +827,7 @@ export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot }) {
       }
     }
     out.push(...overLimitNotes(botRoot));
-    out.push('回「撤销记忆 编号」撤销（可以写多个，比如「撤销记忆 1 3」），「撤销记忆 全部」全部撤销。编号以这份清单为准。');
+    out.push(`回「${cmd} 编号」撤销（可以写多个，比如「${cmd} 1 3」），「${cmd} 全部」全部撤销。编号以这份清单为准。`);
     return out.join('\n');
   });
 }
@@ -612,14 +839,17 @@ const pendingFile = (botRoot) => path.join(botRoot, 'data', 'state', 'memory_dig
 const ackFile = (botRoot) => path.join(botRoot, 'data', 'state', 'memory_digest_ack.json');
 
 function plainDigestText(items, since, botName) {
+  // 只列记忆：设置是用户当面让机器人改的，改的时候已经说过了；管理员在自己那边看得到
+  items = items.filter((i) => i.kind !== 'setting');
   const lines = [`📝 记忆变动（${sinceText(since)} 以来）`, ...items.slice(0, DIGEST_MAX_ITEMS).map(plainItemLine)];
   if (items.length > DIGEST_MAX_ITEMS) lines.push(`另外还有 ${items.length - DIGEST_MAX_ITEMS} 条小改动，就不一一列了。`);
   lines.push(`哪里记得不对，直接告诉${botName}是哪件事就行～`);
   return lines.join('\n');
 }
 
-// 写进实例自己的目录：先写临时文件、改成实例账号所有，再改名，对方永远读不到写了一半的内容
-function writeJsonForBot(file, data) {
+// 写进实例自己的目录：先写临时文件、改成那个目录的属主，再改名，对方永远读不到写了一半的内容；路径经过软链接就不写
+export function writeJsonForBot(botRoot, file, data) {
+  if (!insideBot(botRoot, file)) throw new Error(`${path.relative(botRoot, file)} 的路径经过软链接，不写`);
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   const st = fs.statSync(dir);
@@ -633,38 +863,61 @@ function writeJsonForBot(file, data) {
  * 主人的机器人每次检查完调用：先看各沙箱实例有没有发出汇报的回执，对上号就把它的汇报进度推到那一版；
  * 再把它现在还没汇报过的改动写成待发的汇报（没有改动就删掉那个文件）。
  */
-export function syncBotDigests({ botsDir = DEFAULT_BOTS_DIR } = {}) {
+export function syncBotDigests({ botsDir = DEFAULT_BOTS_DIR, includeOwner = false } = {}) {
   return withLock(() => {
     const owner = ownerBotName();
     const state = loadReview();
     let dirty = initReported(botsDir, state);
-    for (const botRoot of discoverBots(botsDir)) {
+    const bots = discoverBots(botsDir);
+    for (const botRoot of bots) {
       const bot = path.basename(botRoot);
-      if (bot === owner) continue;
+      if (bot === owner && !includeOwner) continue;
       const pending = state.pending?.[bot] || {};
       const ack = readJson(ackFile(botRoot));
       if (ack?.id && pending[ack.id] && state.acked?.[bot] !== ack.id) {
-        recordDelivered(state, bot, pending[ack.id], Number(ack.delivered_at) || Date.now());
+        const p = pending[ack.id];
+        recordDelivered(state, bot, p, Number(ack.delivered_at) || Date.now());
+        if (p.items) setShown(state, bot, p.items);
+        if (p.pointed) state.pointed = { ...state.pointed, ...p.pointed };
         state.acked = { ...state.acked, [bot]: ack.id };
         state.pending = { ...state.pending, [bot]: {} };
         dirty = true;
       }
+      const numbered = (loadBotSettings(botRoot).digest_style || (bot === owner ? 'numbered' : 'plain')) !== 'plain';
       const file = pendingFile(botRoot);
       const repo = ensureRepo(bot);
       const to = head(repo);
       const from = state.reported[bot];
+      // 管理员的汇报：别的机器人从上次提醒（或管理员上次看过）以来有几处设置变动
+      const pointers = numbered && bot === owner
+        ? bots.filter((b) => b !== botRoot).map((b) => {
+          const other = path.basename(b);
+          const otherRepo = ensureRepo(other);
+          const otherTo = head(otherRepo);
+          const otherFrom = isCommit(otherRepo, state.pointed?.[other]) ? state.pointed[other] : state.reported?.[other];
+          const n = otherFrom && otherFrom !== otherTo ? settingItems(b, otherFrom, otherTo).length : 0;
+          return { bot: other, name: displayName(b), n, to: otherTo };
+        }).filter((p) => p.n > 0)
+        : [];
       const current = readJson(file);
-      const id = `${from.slice(0, 10)}-${to.slice(0, 10)}`;
+      const id = `${from.slice(0, 10)}-${to.slice(0, 10)}${pointers.map((p) => `-${p.bot}${p.to.slice(0, 6)}`).join('')}`;
       if (current?.id === id) continue;
       const { items } = from === to ? { items: [] } : botItems(botRoot, from);
-      if (!items.length) {
+      const listed = numbered ? items : items.filter((i) => i.kind !== 'setting');
+      if (!listed.length && !pointers.length) {
         if (current) fs.rmSync(file, { force: true });
         continue;
       }
       const since = state.reported_at?.[bot] || commitTime(repo, from);
-      writeJsonForBot(file, { id, at: Date.now(), count: items.length, text: plainDigestText(items, since, displayName(botRoot)) });
+      const pointerLines = pointers.map((p) => `（${p.name}有 ${p.n} 处设置变动，回「${p.name}改动」看）`);
+      let text;
+      if (!numbered) text = plainDigestText(items, since, displayName(botRoot));
+      else if (!items.length) text = pointers.map((p) => `📝 ${p.name}有 ${p.n} 处设置变动，回「${p.name}改动」看。`).join('\n');
+      else text = numberedDigestText(items, since, [...overLimitNotes(botRoot), ...pointerLines]);
+      writeJsonForBot(botRoot, file, { id, at: Date.now(), count: listed.length, text });
       // 只留最近几份的范围：回执可能对应稍早写的那一份
-      const ids = Object.entries({ ...(state.pending?.[bot] || {}), [id]: { from, to } }).slice(-5);
+      const entry = { from, to, ...(numbered ? { items: items.map(storedItem) } : {}), ...(pointers.length ? { pointed: Object.fromEntries(pointers.map((p) => [p.bot, p.to])) } : {}) };
+      const ids = Object.entries({ ...(state.pending?.[bot] || {}), [id]: entry }).slice(-5);
       state.pending = { ...state.pending, [bot]: Object.fromEntries(ids) };
       dirty = true;
     }
@@ -677,26 +930,43 @@ export function syncBotDigests({ botsDir = DEFAULT_BOTS_DIR } = {}) {
 function writeBack(botRoot, repo, rel) {
   const src = path.join(repo, rel);
   const dst = path.join(botRoot, rel);
-  if (!fs.existsSync(src)) {
+  if (!insideBot(botRoot, dst)) throw new Error(`${rel} 的路径经过软链接，不写回`);
+  let srcSt = null;
+  try { srcSt = fs.lstatSync(src); } catch {}
+  if (!srcSt) {
     fs.rmSync(dst, { force: true });
     return;
   }
   let st = null;
-  try { st = fs.statSync(dst); } catch {}
+  try { st = fs.lstatSync(dst); } catch {}
+  // 新建的文件、文件夹跟它所在的文件夹同一个属主；直接放在实例目录下的归这个机器人自己
+  // （看它 data/ 的属主：沙箱里的机器人，实例目录本身归 root）
+  const ownerOf = (d) => {
+    if (d !== botRoot) return fs.statSync(d);
+    try { return fs.statSync(path.join(botRoot, 'data')); } catch { return fs.statSync(botRoot); }
+  };
   const dir = path.dirname(dst);
-  if (!fs.existsSync(dir)) {
-    const rootSt = fs.statSync(botRoot);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.chownSync(dir, rootSt.uid, rootSt.gid);
+  const missing = [];
+  for (let d = dir; d !== botRoot && !fs.existsSync(d); d = path.dirname(d)) missing.unshift(d);
+  for (const d of missing) {
+    const o = ownerOf(path.dirname(d));
+    fs.mkdirSync(d);
+    fs.chownSync(d, o.uid, o.gid);
   }
   const dirSt = fs.statSync(dir);
-  const uid = st ? st.uid : dirSt.uid;
-  const gid = st ? st.gid : dirSt.gid;
-  const mode = st ? st.mode & 0o7777 : dirSt.mode & 0o666;
+  const owner = ownerOf(dir);
+  const uid = st ? st.uid : owner.uid;
+  const gid = st ? st.gid : owner.gid;
   const tmp = `${dst}.${process.pid}.${Date.now()}.undo.tmp`;
-  fs.writeFileSync(tmp, fs.readFileSync(src));
-  fs.chmodSync(tmp, mode);
-  fs.chownSync(tmp, uid, gid);
+  if (srcSt.isSymbolicLink()) {
+    fs.symlinkSync(fs.readlinkSync(src), tmp);
+    fs.lchownSync(tmp, uid, gid);
+  } else {
+    const mode = st && st.isFile() ? st.mode & 0o7777 : dirSt.mode & 0o666;
+    fs.writeFileSync(tmp, fs.readFileSync(src));
+    fs.chmodSync(tmp, mode);
+    fs.chownSync(tmp, uid, gid);
+  }
   fs.renameSync(tmp, dst);
 }
 
@@ -704,15 +974,16 @@ function writeBack(botRoot, repo, rel) {
  * 撤销最近一份清单里的几条（selection 是编号数组，或 'all'）。返回给主人的回复。
  * 先把线上现状存一版；每条按"反向打补丁"撤销，那一段后来又被改过就不硬改，告诉主人。
  */
-export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR } = {}) {
+// scope：「撤销记忆 全部」只撤记忆那几条（'memory'，默认），「撤销 全部」连设置一起撤（'all'）；写了编号的按编号撤
+export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR, viewer = null, scope = 'memory' } = {}) {
   return withLock(() => {
     const state = loadReview();
-    const shown = state.shown;
+    const shown = shownFor(state, viewer || settings.only || ownerBotName());
     if (!shown?.items?.length || Date.now() - shown.at > SHOWN_VALID_MS) {
       return '现在没有可以撤销的清单。回「记忆改动」看看最近的改动。';
     }
     const picked = selection === 'all'
-      ? shown.items.filter((i) => !i.undone)
+      ? shown.items.filter((i) => !i.undone && (scope === 'all' || i.kind !== 'setting'))
       : selection.map((n) => shown.items.find((i) => i.n === n) || { n, missing: true });
     const missing = picked.filter((i) => i.missing).map((i) => i.n);
     const already = picked.filter((i) => i.undone).map((i) => i.n);
@@ -722,7 +993,7 @@ export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR } = {}) {
     if (todo.length) {
       snapshotAllUnlocked(botsDir, { force: true });
       // 同一个文件从后往前撤，前面那些段的行号不受影响
-      const order = [...todo].sort((a, b) => a.bot.localeCompare(b.bot) || a.rel.localeCompare(b.rel) || b.hunk - a.hunk);
+      const order = todo.filter((i) => i.kind !== 'setting').sort((a, b) => a.bot.localeCompare(b.bot) || a.rel.localeCompare(b.rel) || b.hunk - a.hunk);
       const touched = new Map();
       for (const it of order) {
         const repo = repoDir(it.bot);
@@ -738,6 +1009,23 @@ export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR } = {}) {
         done.push(it);
         if (!touched.has(it.bot)) touched.set(it.bot, new Set());
         touched.get(it.bot).add(it.rel);
+      }
+      // 设置按项整个退回改之前的样子（新增的就删掉）；那一项后来又改过就不硬改
+      for (const it of todo.filter((i) => i.kind === 'setting')) {
+        const repo = repoDir(it.bot);
+        const unchanged = isCommit(repo, it.from) && isCommit(repo, it.to)
+          && (it.files || []).every((rel) => git(repo, ['diff', '--quiet', it.to, 'HEAD', '--', rel], { allowFail: true }) !== null);
+        if (!unchanged || !it.files?.length) {
+          failed.push(it);
+          continue;
+        }
+        for (const rel of it.files) {
+          if (treeMode(repo, it.from, rel)) git(repo, ['checkout', it.from, '--', rel]);
+          else fs.rmSync(path.join(repo, rel), { force: true });
+        }
+        done.push(it);
+        if (!touched.has(it.bot)) touched.set(it.bot, new Set());
+        for (const rel of it.files) touched.get(it.bot).add(rel);
       }
       for (const [bot, rels] of touched) {
         const botRoot = path.join(botsDir, bot);
@@ -769,14 +1057,17 @@ export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR } = {}) {
  */
 export function parseMemoryCommand(text) {
   const t = String(text || '').trim().replace(/[０-９]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xfee0));
-  let m = t.match(/^(?:(.{1,12}?)的?)?记忆(?:改动|变动)$/);
-  if (m) return m[1] ? { type: 'show', name: m[1] } : { type: 'show' };
-  m = t.match(/^记忆(?:改动|变动)\s+(.{1,12})$/);
+  // 「记忆改动」「改动」看自己的；「X记忆改动」「X改动」「X的改动」「记忆改动 X」「改动 X」看机器人 X 的
+  if (/^(?:记忆)?(?:改动|变动)$/.test(t)) return { type: 'show' };
+  let m = t.match(/^(.{1,12}?)的?(?:记忆)?(?:改动|变动)$/);
+  if (m) return { type: 'show', name: m[1] };
+  m = t.match(/^(?:记忆)?(?:改动|变动)\s+(.{1,12})$/);
   if (m) return { type: 'show', name: m[1].trim() };
-  m = t.match(/^撤销记忆\s*(全部|所有|\d+(?:\s*[,，、\s]\s*\d+)*)$/);
+  // 「撤销记忆 2」「撤销 1 3」；「撤销记忆 全部」只撤记忆，「撤销 全部」连设置一起撤（scope: 'all'）
+  m = t.match(/^撤销(记忆)?\s*(全部|所有|\d+(?:\s*[,，、\s]\s*\d+)*)$/);
   if (!m) return null;
-  if (/^(全部|所有)$/.test(m[1])) return { type: 'undo', items: 'all' };
-  return { type: 'undo', items: [...new Set(m[1].split(/\D+/).filter(Boolean).map(Number))] };
+  if (/^(全部|所有)$/.test(m[2])) return m[1] ? { type: 'undo', items: 'all' } : { type: 'undo', items: 'all', scope: 'all' };
+  return { type: 'undo', items: [...new Set(m[2].split(/\D+/).filter(Boolean).map(Number))] };
 }
 
 // ---------- 上线 / 命令行 ----------
@@ -837,8 +1128,9 @@ export function restoreBot(bot, rev, { botsDir = DEFAULT_BOTS_DIR } = {}) {
     snapshotBot(botRoot, { force: true });
     const repo = repoDir(bot);
     const target = resolveRev(repo, rev);
-    const now = git(repo, ['ls-files']).split('\n').filter(Boolean);
-    const then = git(repo, ['ls-tree', '-r', '--name-only', target]).split('\n').filter(Boolean);
+    // 只恢复记忆：设置文件按条撤销（「撤销 N」），不跟着整体恢复
+    const now = git(repo, ['ls-files']).split('\n').filter(Boolean).filter(isMemoryRel);
+    const then = git(repo, ['ls-tree', '-r', '--name-only', target]).split('\n').filter(Boolean).filter(isMemoryRel);
     for (const rel of now) if (!then.includes(rel)) fs.rmSync(path.join(repo, rel), { force: true });
     if (then.length) git(repo, ['checkout', target, '--', ...then]);
     for (const rel of new Set([...now, ...then])) writeBack(botRoot, repo, rel);

@@ -11,7 +11,7 @@
   * B站：`data/downloads/bilibili/`
   * 小红书：`data/downloads/xiaohongshu/`
   * 微信收到的附件：`data/downloads/wechat/`
-* **短视频文案提取与总结**：用户发来短视频链接并要求提取台词、文案或总结时，调用技能 `skills/video-transcriber`（执行项目目录下的 `skills/video-transcriber/scripts/video_transcriber.py "<链接或文件>" --output-dir "<当前实例的 data/downloads 目录>"`）。短视频先发视频卡片，再把【逐字稿】和【核心要点】作为文字回复；**B站长视频默认只转录文案和总结，不下载视频文件**（除非用户明确要求下载）。
+* **技能**：抖音、B站、小红书、转文字是官方技能，放在 `skills-store/`。用 `node core/skills.js list` 看有哪些、`node core/skills.js install <名字>` 装上，按各自的 SKILL.md 用。技能要的凭证让用户发「设置凭证 <技能> <内容>」，程序直接存好。
 
 ## 3. 定时提醒准则
 * **复用调度器**：所有定时提醒都交给已经在运行的 `scheduler.js`，不要用 sleep、挂起等待或阻塞轮询。
@@ -40,5 +40,5 @@
 * 每次改动都会存进记忆历史，用户可以在微信里回「记忆改动」查看、回「撤销记忆 N」撤销。
 
 ## 8. 程序代码变更准则
-* **不主动改程序代码**：`core/`、`deploy/`、`scripts/`、`skills/` 和这份规则文件不要自己动手改。发现程序有问题，向用户说清楚问题和建议，由用户决定；用户明确要求时，先说明改哪些文件、有什么风险，确认后再改，并说明要重启服务才生效。
+* **不主动改程序代码**：`core/`、`deploy/`、`scripts/`、`skills-store/` 和这份规则文件不要自己动手改。发现程序有问题，向用户说清楚问题和建议，由用户决定；用户明确要求时，先说明改哪些文件、有什么风险，确认后再改，并说明要重启服务才生效。
 * **可以直接改的**：自己实例目录里的 `tasks.js`、`data/reminders.json` 和记忆文件。

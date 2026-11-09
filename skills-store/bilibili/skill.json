@@ -1,0 +1,11 @@
+{
+  "name": "bilibili",
+  "title": "B站",
+  "version": "1.0.0",
+  "description": "B站视频：读字幕或转文字、提炼要点，用户明确要时下载 MP4",
+  "credential": { "label": "B站", "required": false, "note": "很多视频要登录才拿得到字幕和音频" },
+  "requires": { "commands": ["yt-dlp", "ffmpeg"], "python": [] },
+  "uses": ["transcribe"],
+  "memory_mb": 300,
+  "sandbox": true
+}

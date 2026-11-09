@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { sendWechatReply, writeJsonAtomic } from './wechat_reply.js';
+import { sendWechatReply, writeJsonAtomic, loadBotSettings } from './wechat_reply.js';
 
 const env = (name, fallback) => Number(process.env[name]) || fallback;
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -129,7 +129,7 @@ function discoverBots() {
     .map((name) => ({ name, dir: path.join(BOTS_DIR, name) }))
     .filter((b) => fs.existsSync(path.join(b.dir, 'config.json')))
     .map((b) => {
-      const cfg = readJson(path.join(b.dir, 'config.json')) || {};
+      const cfg = loadBotSettings(b.dir);
       return { ...b, display: cfg.bot_name || b.name, user: cfg.user_nickname || '用户' };
     });
 }
@@ -161,14 +161,16 @@ const EVENTS = {
 // keys：每个问题的通知记录（有记录 = 已通知、还没恢复）；units：服务重启计数采样；retry：没发出去待重试的通知；
 // ownerWindowClosedFor / windowClosedFor[实例]：经这个机器人发微信被拒（窗口已关）时，它的用户最后一条消息的时间，
 // 用户再发消息之前不再走微信（统一管理时只有主人的机器人发，记在 ownerWindowClosedFor）；
-// codeDirtySince：从什么时候起看到程序代码有没提交的改动
-let state = { keys: {}, units: {}, retry: [], ownerWindowClosedFor: null, windowClosedFor: {}, codeDirtySince: 0 };
+// codeDirtySince：从什么时候起看到程序代码有没提交的改动；proposals：已经通知过的补丁（实例/文件名 → 修改时间:大小）；
+// pendingProposals：待审核补丁记录；proposalsDone：已归档上线的补丁记录
+let state = { keys: {}, units: {}, retry: [], ownerWindowClosedFor: null, windowClosedFor: {}, codeDirtySince: 0, proposals: {}, pendingProposals: {}, proposalsDone: {} };
 function loadState() {
   const s = readJson(STATE_FILE) || {};
   state = {
     keys: s.keys || {}, units: s.units || {}, retry: s.retry || [],
     ownerWindowClosedFor: s.ownerWindowClosedFor ?? null, windowClosedFor: s.windowClosedFor || {},
-    codeDirtySince: s.codeDirtySince || 0,
+    codeDirtySince: s.codeDirtySince || 0, proposals: s.proposals || {},
+    pendingProposals: s.pendingProposals || {}, proposalsDone: s.proposalsDone || {},
   };
 }
 
@@ -195,17 +197,34 @@ function notify(outgoing, key, alert, dedupeMs) {
   state.keys[key] = { firstAt: s?.firstAt || alert.at, lastSentAt: now, repeats: 0, ...(alert.sticky ? { sticky: stickyAlert } : {}) };
 }
 
+const ALERT_FILE = /^\d{10,}-[^/]+\.json$/;
+function realDir(root, dir) {
+  try {
+    let cur = root;
+    for (const part of path.relative(root, dir).split(path.sep)) {
+      cur = path.join(cur, part);
+      if (!fs.lstatSync(cur).isDirectory()) return false;
+    }
+    return fs.realpathSync(dir).startsWith(fs.realpathSync(root) + path.sep);
+  } catch {
+    return false;
+  }
+}
+
 function checkBot(outgoing, bot, dedupeMs) {
   const now = Date.now();
   const base = { bot: bot.name, botName: bot.display };
 
   // 1. 各进程写的告警事件（文件名以时间开头，按顺序处理）
+  // 以 root 读、删机器人目录里的文件：data/alerts 得是真实的文件夹（不是软链接），文件名得是告警事件的格式（时间开头），
+  // 免得沙箱里的机器人放个链接，借监控去读、删别处的文件
   const alertsDir = path.join(bot.dir, 'data', 'alerts');
   let files = [];
-  try { files = fs.readdirSync(alertsDir).filter((f) => f.endsWith('.json')).sort(); } catch {}
+  try { if (realDir(bot.dir, alertsDir)) files = fs.readdirSync(alertsDir).filter((f) => ALERT_FILE.test(f)).sort(); } catch {}
   for (const f of files) {
     const p = path.join(alertsDir, f);
-    const ev = readJson(p);
+    let ev = null;
+    try { if (fs.lstatSync(p).isFile()) ev = readJson(p); } catch {}
     fs.rmSync(p, { force: true });
     if (!ev) continue;
     const meta = EVENTS[ev.kind] || { key: ev.kind, event: true, title: `其他问题（${ev.kind}）` };
@@ -341,6 +360,112 @@ function checkCode(outgoing, cfg, bots, dedupeMs) {
   }, dedupeMs);
 }
 
+// 机器人发现程序问题时，把建议的改法写成补丁放进自己的 data/proposals/（规则第 7 节）：每个新补丁（或改过的补丁）通知一次。
+// 只列文件名，不发补丁内容；处理完挪进 data/proposals/ 下的子目录（比如 done/），就不再算待处理，并自动发送补丁审核上线通知。
+function checkProposals(outgoing, bots) {
+  const current = {};
+  if (!state.pendingProposals) state.pendingProposals = {};
+  if (!state.proposalsDone) state.proposalsDone = {};
+
+  for (const bot of bots) {
+    const dir = path.join(bot.dir, 'data', 'proposals');
+    let names;
+    try {
+      names = fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isFile() && !d.name.startsWith('.')).map((d) => d.name).sort();
+    } catch (err) {
+      // 读不了（不是没有这个目录）：先留着之前的记录，免得读得到了又把旧补丁再报一遍
+      if (err.code !== 'ENOENT') for (const [k, v] of Object.entries(state.proposals)) if (k.startsWith(`${bot.name}/`)) current[k] = v;
+      continue;
+    }
+    const fresh = [];
+    for (const name of names) {
+      let st;
+      try { st = fs.statSync(path.join(dir, name)); } catch { continue; }
+      const key = `${bot.name}/${name}`;
+      current[key] = `${Math.round(st.mtimeMs)}:${st.size}`;
+      state.pendingProposals[key] = true;
+      if (state.proposals[key] !== current[key]) fresh.push(name);
+    }
+    if (fresh.length) {
+      outgoing.push({
+        at: Date.now(), bot: bot.name, botName: bot.display, notice: true,
+        title: `写了${fresh.length > 1 ? ` ${fresh.length} 个` : '一个'}程序补丁，等管理员测试上线`,
+        detail: `${fresh.slice(0, 5).join('、')}${fresh.length > 5 ? ` 等 ${fresh.length} 个` : ''}`,
+        advice: `补丁在 ${dir}/ ，转给管理员测试后再上线；处理完挪进那里的 done/ 子目录，就不会再提醒。`,
+      });
+    }
+
+    // 检查已审核上线移入 done/ 的补丁
+    const doneDir = path.join(dir, 'done');
+    let doneNames = [];
+    try {
+      doneNames = fs.readdirSync(doneDir, { withFileTypes: true }).filter((d) => d.isFile() && !d.name.startsWith('.')).map((d) => d.name).sort();
+    } catch {}
+
+    const approved = [];
+    for (const name of doneNames) {
+      const key = `${bot.name}/${name}`;
+      // 如果这个补丁之前在 pendingProposals（待审核状态），现在出现在 done/ 且未通知过上线
+      if (state.pendingProposals[key] && !state.proposalsDone[key]) {
+        state.proposalsDone[key] = Date.now();
+        delete state.pendingProposals[key];
+        approved.push(name);
+      }
+    }
+    if (approved.length) {
+      outgoing.push({
+        at: Date.now(), bot: bot.name, botName: bot.display, notice: true,
+        title: `程序补丁已审核通过并上线`,
+        detail: `${approved.slice(0, 5).join('、')}${approved.length > 5 ? ` 等 ${approved.length} 个` : ''}`,
+        advice: `补丁已合入主干代码并移入 ${doneDir}/ 归档。`,
+      });
+    }
+  }
+  state.proposals = current;
+}
+
+// 服务器层面的：磁盘快满了；管理服务（版本记录和管理指令都靠它）停了。经管理员的机器人（没配置就是第一个机器人）发
+const DISK_MIN_FREE_PCT = env('MONITOR_DISK_MIN_FREE_PCT', 10);
+const MANAGER_UNIT = process.env.CLAWBOT_MANAGER_UNIT || 'clawbot-manager';
+function checkHost(outgoing, cfg, bots, dedupeMs) {
+  const via = (cfg.owner_bot && bots.find((b) => b.name === cfg.owner_bot)) || bots[0];
+  if (!via) return;
+  const base = { bot: via.name, botName: via.display };
+  const now = Date.now();
+  try {
+    const s = fs.statfsSync(process.env.CLAWBOT_DISK_PATH || '/');
+    const freePct = (s.bavail / s.blocks) * 100;
+    const key = `${via.name}:disk`;
+    if (freePct < DISK_MIN_FREE_PCT) {
+      notify(outgoing, key, {
+        ...base, sticky: true, title: '服务器磁盘快满了',
+        detail: `只剩 ${freePct.toFixed(1)}%（${((s.bavail * s.bsize) / 1e9).toFixed(1)} GB）`,
+        advice: `看看哪里占得多：du -sh ${BOTS_DIR}/*/data/downloads /var/log ；下载过的视频可以删掉旧的。`,
+      }, dedupeMs);
+    } else if (freePct >= DISK_MIN_FREE_PCT + 2) {
+      notify(outgoing, key, { ...base, title: '服务器磁盘空间恢复了', recovery: true }, dedupeMs);
+    }
+  } catch (err) {
+    if (!state.diskCheckFailed) console.error('[监控] 查看磁盘空间失败:', err.message);
+    state.diskCheckFailed = true;
+  }
+  // 管理服务：没装（没用统一管理）就不管
+  const st = unitStatus(MANAGER_UNIT);
+  if (!st || st.load !== 'loaded') return;
+  const u = (state.units[MANAGER_UNIT] ||= { samples: [], downSince: 0 });
+  u.downSince = st.active === 'active' ? 0 : u.downSince || now;
+  const key = `${via.name}:manager`;
+  if (u.downSince && now - u.downSince >= DOWN_AFTER_MS) {
+    notify(outgoing, key, {
+      ...base, sticky: true, title: '管理服务停了',
+      detail: `状态 ${st.active}，已经 ${duration(now - u.downSince)}：版本记录、早间的改动汇报和「记忆改动」「撤销」这些指令都暂停了`,
+      advice: `查看状态：systemctl status ${MANAGER_UNIT} ；日志：journalctl -u ${MANAGER_UNIT} -n 50`,
+    }, dedupeMs);
+  } else if (st.active === 'active') {
+    notify(outgoing, key, { ...base, title: '管理服务已恢复', recovery: true }, dedupeMs);
+  }
+}
+
 function collect(outgoing, dedupeMs, cfg = {}) {
   const bots = discoverBots();
   for (const bot of bots) {
@@ -354,6 +479,16 @@ function collect(outgoing, dedupeMs, cfg = {}) {
     checkCode(outgoing, cfg, bots, dedupeMs);
   } catch (err) {
     console.error('[监控] 检查程序代码改动出错:', err.message);
+  }
+  try {
+    checkProposals(outgoing, bots);
+  } catch (err) {
+    console.error('[监控] 检查补丁出错:', err.message);
+  }
+  try {
+    checkHost(outgoing, cfg, bots, dedupeMs);
+  } catch (err) {
+    console.error('[监控] 检查服务器出错:', err.message);
   }
   const now = Date.now();
   const names = new Set(bots.map((b) => b.name));
@@ -370,7 +505,7 @@ function collect(outgoing, dedupeMs, cfg = {}) {
 }
 
 function formatAlert(alert, dedupeMs) {
-  const tag = alert.test ? '测试' : alert.recovery ? '恢复' : '告警';
+  const tag = alert.test ? '测试' : alert.recovery ? '恢复' : alert.notice ? '提醒' : '告警';
   const subject = `【ClawBot ${tag}】${alert.botName}：${alert.title}`;
   const lines = [`实例：${alert.botName}（${alert.bot}）`, `时间：${beijingTime(alert.at)}（北京时间）`];
   if (alert.detail) lines.push(`详情：${alert.detail}`);
@@ -390,7 +525,7 @@ const withTimeout = (promise, ms) => Promise.race([
 async function viaWechat(cfg, text, bot) {
   const via = cfg.owner_bot || bot;
   const viaDir = via ? path.join(BOTS_DIR, via) : null;
-  const viaConfig = viaDir ? readJson(path.join(viaDir, 'config.json')) : null;
+  const viaConfig = viaDir ? loadBotSettings(viaDir) : null;
   if (!viaConfig?.bot_token || !viaConfig.authorized_user_id) return { status: 'skipped', text: '微信未配置' };
   const viaName = viaConfig.bot_name || via;
   const userName = cfg.owner_bot ? '主人' : viaConfig.user_nickname || '用户';
@@ -431,7 +566,7 @@ function viaEmail(email, subject, body) {
 async function deliver(alert, cfg, dedupeMs, channels = ['wechat', 'email']) {
   const { subject, body } = formatAlert(alert, dedupeMs);
   const results = [];
-  if (channels.includes('wechat')) results.push(await viaWechat(cfg, `${alert.recovery ? '✅' : '⚠️'}${subject}\n${body}`, alert.bot));
+  if (channels.includes('wechat')) results.push(await viaWechat(cfg, `${alert.recovery ? '✅' : alert.notice ? '📝' : '⚠️'}${subject}\n${body}`, alert.bot));
   if (channels.includes('email')) results.push(await viaEmail(cfg.email, subject, body));
   console.log(`[告警通知] ${alert.bot}：${alert.title} → ${results.map((r) => r.text).join('，')}`);
   return results;

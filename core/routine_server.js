@@ -1,5 +1,7 @@
-process.env.NO_PROXY = '127.0.0.1,localhost';
-process.env.no_proxy = '127.0.0.1,localhost';
+// 本机接口不走代理；服务配置里另外写了不走代理的（比如装 Python 包用的 pypi.org）一起留着，智能体执行的命令也用得上
+const keepNoProxy = (v) => [...new Set(['127.0.0.1', 'localhost', ...String(v || '').split(',').map((x) => x.trim()).filter(Boolean)])].join(',');
+process.env.NO_PROXY = keepNoProxy(process.env.NO_PROXY);
+process.env.no_proxy = keepNoProxy(process.env.no_proxy);
 
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -19,6 +21,7 @@ import {
   saveRuntimeState,
   describeText,
   describePath,
+  writeJsonAtomic,
 } from './wechat_reply.js';
 import {
   enqueueInbox,
@@ -32,6 +35,7 @@ import {
 } from './inbox.js';
 import { RESET_MARKER, loadTopicsConfig, capForLoading, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS, TOPIC_ALWAYS_BUDGET } from './memory_config.js';
 import { memoryMode, useStandaloneHistory, parseMemoryCommand, findBotByName, showChanges, undoItems } from './memory_history.js';
+import { parseCredentialCommand, saveSkillCredential, credentialHelp, isInstalled } from './skills.js';
 import { raiseAlert } from './alert.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
 
@@ -42,6 +46,9 @@ const botRoot = process.cwd();
 const MEMORY_MODE = memoryMode(botRoot);
 if (MEMORY_MODE === 'standalone') useStandaloneHistory(botRoot);
 const MEMORY_REVIEW = MEMORY_MODE === 'owner' || MEMORY_MODE === 'standalone';
+// 统一管理（managed）：管理指令写成请求交给管理服务，它处理完直接经这个机器人的微信回复
+const MANAGED = MEMORY_MODE === 'managed';
+const REQUEST_WAIT_MS = Number(process.env.CLAWBOT_REQUEST_WAIT_MS) || 20_000;
 
 // 自动检测监听端口（优先配置项 port -> webhook_url 端口 -> 环境变量 -> 默认 18888）
 function resolvePort() {
@@ -111,7 +118,7 @@ function appendLog(line) {
 }
 
 // 允许作为微信文件/原生视频卡片投递的交付物格式
-const ALLOWED_DELIVERY_DOCS = /\.(md|html|htm|pdf|docx|xlsx|csv|zip|tar\.gz)$/i;
+const ALLOWED_DELIVERY_DOCS = /\.(md|html|htm|pdf|docx|doc|xlsx|xls|pptx|ppt|csv|txt|zip|tar\.gz|mp3|m4a|wav)$/i;
 const ALLOWED_DELIVERY_VIDEOS = /\.(mp4|mov|m4v)$/i;
 
 function isDeliverableFile(filePath) {
@@ -163,6 +170,7 @@ function isPathAllowedForThisBot(p) {
  * Scan agent reply for generated image files, video files, or document files.
  */
 function extractMediaPaths(text) {
+  const isIncomingWechatMedia = (filepath) => /\/downloads\/wechat\//i.test(filepath);
   if (!text) return { images: [], files: [], videos: [] };
   const images = new Set();
   const files = new Set();
@@ -171,7 +179,7 @@ function extractMediaPaths(text) {
   const fileUrlRegex = /file:\/\/(\/[^\s\)\"\'\<\>]+)/gi;
   for (const m of text.matchAll(fileUrlRegex)) {
     const p = m[1];
-    if (!isPathAllowedForThisBot(p)) continue;
+    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p)) continue;
     if (fs.existsSync(p) && fs.statSync(p).isFile()) {
       const stats = fs.statSync(p);
       const isRecent = (Date.now() - stats.mtimeMs) < 600000; // 仅推送10分钟内生成的文件
@@ -187,10 +195,10 @@ function extractMediaPaths(text) {
     }
   }
 
-  const absPathRegex = /(\/(?:srv|root|tmp)[^\s\)\"\'\<\>]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|xlsx|zip|tar\.gz|md|html|htm|mp4|mov|m4v))/gi;
+  const absPathRegex = /(\/(?:srv|root|tmp)[^\s\)\"\'\<\>]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|doc|xlsx|xls|pptx|ppt|csv|txt|zip|tar\.gz|md|html|htm|mp4|mov|m4v|mp3|m4a|wav))/gi;
   for (const m of text.matchAll(absPathRegex)) {
     const p = m[1];
-    if (!isPathAllowedForThisBot(p)) continue;
+    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p)) continue;
     if (fs.existsSync(p) && fs.statSync(p).isFile()) {
       const stats = fs.statSync(p);
       const isRecent = (Date.now() - stats.mtimeMs) < 600000; // 仅推送10分钟内生成的文件
@@ -207,10 +215,10 @@ function extractMediaPaths(text) {
   }
 
   // 兼容带空格或被引号/反引号包裹的文件路径
-  const quotedPathRegex = /[`"'](\/(?:srv|root|tmp)[^`"'\r\n]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|xlsx|zip|tar\.gz|md|html|htm|mp4|mov|m4v))[`"']/gi;
+  const quotedPathRegex = /[`"'](\/(?:srv|root|tmp)[^`"'\r\n]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|doc|xlsx|xls|pptx|ppt|csv|txt|zip|tar\.gz|md|html|htm|mp4|mov|m4v|mp3|m4a|wav))[`"']/gi;
   for (const m of text.matchAll(quotedPathRegex)) {
     const p = m[1].trim();
-    if (!isPathAllowedForThisBot(p)) continue;
+    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p)) continue;
     if (fs.existsSync(p) && fs.statSync(p).isFile()) {
       const stats = fs.statSync(p);
       const isRecent = (Date.now() - stats.mtimeMs) < 600000;
@@ -237,7 +245,7 @@ function extractMediaPaths(text) {
     for (const baseD of downloadDirs) {
       if (fs.existsSync(baseD)) {
         try {
-          const subdirs = ['', 'douyin', 'bilibili', 'xiaohongshu', 'wechat'];
+          const subdirs = ['', 'douyin', 'bilibili', 'xiaohongshu'];
           let latestVideo = null;
           let latestMtime = 0;
           for (const sub of subdirs) {
@@ -634,6 +642,31 @@ function recentUserTexts(count, currentText) {
   return users.slice(-count);
 }
 
+// 「X改动」的 X 是哪个机器人：自己；独立模式下看 bots/ 下有哪些；统一管理时只认管理服务给管理员准备的名单
+function resolveBotName(name, botsDir, config) {
+  const want = String(name || '').trim().toLowerCase();
+  if (!want) return null;
+  const self = path.basename(botRoot);
+  if (want === self.toLowerCase() || want === String(config.bot_name || '').toLowerCase()) return self;
+  if (!MANAGED) return findBotByName(name, { botsDir });
+  let list = [];
+  try { list = loadRuntimeState('manager_bots'); } catch {}
+  const hit = (Array.isArray(list) ? list : []).find((b) => String(b.bot).toLowerCase() === want || String(b.name).toLowerCase() === want);
+  return hit ? hit.bot : null;
+}
+
+// 转给管理服务的请求，10 分钟以前的（管理服务没处理的）清掉
+function cleanOldRequests() {
+  const dir = path.join(dataDir, 'requests');
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch { return; }
+  for (const f of files) {
+    try {
+      if (Date.now() - fs.statSync(path.join(dir, f)).mtimeMs > 600_000) fs.rmSync(path.join(dir, f), { force: true });
+    } catch {}
+  }
+}
+
 /**
  * 加载当前 Bot 的专题分卷：小专题每条消息都带（从小到大放，合计不超过 TOPIC_ALWAYS_BUDGET 字）；
  * 放不下的大专题，这条消息或之前两条用户消息里提到关键词才带，聊着聊着不会突然丢掉。
@@ -714,6 +747,30 @@ async function handleWechatTask(task) {
   console.log(`\n================== [微信消息开始处理] ==================`);
   console.log(`用户ID: ${from_user_id}`);
   console.log(`消息内容: ${describeText(message_text)}`);
+
+  // 「设置凭证 B站 <cookie>」：程序直接存进这个机器人自己的 data/skills/<技能>/cookie.txt，不经过智能体；
+  // 凭证不写进聊天日志（只记一句设了哪个），免得被整理进记忆、留在版本记录里
+  const credential = parseCredentialCommand(message_text);
+  if (credential) {
+    appendLog(`微信接收 (${from_user_id}): 设置凭证 ${credential.label}（内容不记录）`);
+    let reply;
+    if (!credential.skill || !credential.value) {
+      reply = `${credential.skill || !credential.label ? '' : `不认识「${credential.label}」。`}${credentialHelp()}`;
+    } else {
+      try {
+        saveSkillCredential(botRoot, credential);
+        reply = `已保存${credential.label}的凭证（只有${config.bot_name || '我'}自己能读，这条消息的内容不会记进聊天记录）。`
+          + (isInstalled(botRoot, credential.skill) ? '' : `${credential.label}技能还没装，要用的话跟我说一声"装上${credential.label}技能"。`);
+      } catch (err) {
+        reply = `凭证没有保存：${err.message}`;
+      }
+    }
+    console.log(`[设置凭证] ${credential.skill || '不认识的技能'}：${reply.startsWith('已保存') ? '已保存' : '没保存'}`);
+    if (context_token) await sendWechatReply(from_user_id, context_token, reply, config);
+    console.log(`====================================================\n`);
+    return null;
+  }
+
   appendLog(`微信接收 (${from_user_id}): ${message_text}`);
 
   // 快捷重置会话指令判断
@@ -744,21 +801,44 @@ async function handleWechatTask(task) {
     return null;
   }
 
-  // 主人的记忆命令：程序直接处理，不经过智能体；回复里有记忆内容，不写进聊天日志（免得被整理进机器人自己的记忆）。
-  // 「记忆改动」看自己的；统一管理时主人还能用「X记忆改动」看实例 X 的——名字对不上任何机器人，就当普通消息交给智能体
+  // 管理指令（「记忆改动」「撤销 N」，管理员还能「X改动」看别的机器人的）：程序直接认，不经过智能体；回复里有记忆内容，
+  // 不写进聊天日志（免得被整理进机器人自己的记忆）。自己管版本的（独立模式）就在这里处理；统一管理时交给管理服务。
+  // 汇报样式是 plain（只列记忆、不编号）的机器人不认这些，照常交给智能体；带名字的对不上任何机器人，也当普通消息
   const botsDir = path.dirname(botRoot);
-  let memoryCommand = MEMORY_REVIEW ? parseMemoryCommand(message_text) : null;
+  const numbered = (config.digest_style || (MEMORY_REVIEW ? 'numbered' : 'plain')) !== 'plain';
+  let memoryCommand = (MEMORY_REVIEW || MANAGED) && numbered ? parseMemoryCommand(message_text) : null;
   let showBot = null;
   if (memoryCommand?.type === 'show') {
-    showBot = memoryCommand.name ? findBotByName(memoryCommand.name, { botsDir }) : path.basename(botRoot);
+    showBot = memoryCommand.name ? resolveBotName(memoryCommand.name, botsDir, config) : path.basename(botRoot);
     if (!showBot) memoryCommand = null;
+  }
+  if (memoryCommand && MANAGED) {
+    const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const file = path.join(dataDir, 'requests', `${id}.json`);
+    try {
+      cleanOldRequests();
+      writeJsonAtomic(file, { id, type: memoryCommand.type, bot: showBot, items: memoryCommand.items, scope: memoryCommand.scope, from_user_id, context_token, at: Date.now() });
+      console.log(`[管理指令] ${memoryCommand.type === 'show' ? '查看改动' : '撤销'}：已交给管理服务`);
+      // 管理服务处理完会删掉请求；过一会儿还在，说明它没在运行，如实告诉用户（监控那边也会告警）
+      setTimeout(() => {
+        if (!fs.existsSync(file)) return;
+        fs.rmSync(file, { force: true });
+        sendWechatReply(from_user_id, context_token, '这条指令暂时没人处理（管理服务没在运行），管理员会收到告警。稍后再发一次试试。', config)
+          .catch((err) => console.error('[回复管理指令失败]:', err.message));
+      }, REQUEST_WAIT_MS).unref();
+    } catch (err) {
+      console.error('[管理指令转交失败]:', err.message);
+      if (from_user_id && context_token) await sendWechatReply(from_user_id, context_token, '这条指令没有转交成功，原因记在日志里了，稍后再试一次。', config);
+    }
+    console.log(`====================================================\n`);
+    return null;
   }
   if (memoryCommand) {
     let reply;
     try {
       reply = memoryCommand.type === 'show'
         ? showChanges({ botsDir, bot: showBot })
-        : undoItems(memoryCommand.items, { botsDir });
+        : undoItems(memoryCommand.items, { botsDir, scope: memoryCommand.scope });
       console.log(`[记忆命令] ${memoryCommand.type === 'show' ? '查看改动' : '撤销'}：已处理`);
     } catch (err) {
       console.error('[记忆命令失败]:', err.message);

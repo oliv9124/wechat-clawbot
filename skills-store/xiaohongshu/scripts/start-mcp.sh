@@ -13,8 +13,25 @@ COOKIES_DST="/tmp/cookies.json"
 mkdir -p "$HOME/.xiaohongshu"
 
 # 同步 cookies（支持多个可能的来源）
+# 机器人自己存的小红书凭证（用户在微信里发「设置凭证 小红书 <cookie>」，存在它自己的 data/skills/xiaohongshu/cookie.txt）
+BOT_COOKIE="${CLAWBOT_BOT_DIR:-$PWD}/data/skills/xiaohongshu/cookie.txt"
+
 sync_cookies() {
     local src=""
+
+    # 优先用机器人自己存的凭证，转成 MCP 要的格式；写出来的文件只有自己能读
+    if [ -s "$BOT_COOKIE" ]; then
+        (umask 077; python3 - "$BOT_COOKIE" "$COOKIES_DST" <<'PY'
+import json, sys
+pairs = [p.strip().split('=', 1) for p in open(sys.argv[1], encoding='utf-8').read().strip().split(';') if '=' in p]
+json.dump([{'name': k.strip(), 'value': v.strip(), 'domain': '.xiaohongshu.com', 'path': '/', 'expires': -1,
+            'httpOnly': False, 'secure': False} for k, v in pairs], open(sys.argv[2], 'w'))
+PY
+        )
+        chmod 600 "$COOKIES_DST"
+        echo "已用这个机器人自己存的小红书凭证"
+        return
+    fi
 
     # 优先使用环境变量指定的路径
     if [ -n "$XHS_COOKIES_SRC" ] && [ -f "$XHS_COOKIES_SRC" ]; then
@@ -27,7 +44,8 @@ sync_cookies() {
 
     if [ -n "$src" ]; then
         if [ ! -f "$COOKIES_DST" ] || [ "$src" -nt "$COOKIES_DST" ]; then
-            cp "$src" "$COOKIES_DST"
+            (umask 077; cp "$src" "$COOKIES_DST")
+            chmod 600 "$COOKIES_DST"
             echo "已同步 cookies: $src -> $COOKIES_DST"
         fi
     fi

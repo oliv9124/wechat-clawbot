@@ -1,0 +1,11 @@
+{
+  "name": "douyin",
+  "title": "抖音",
+  "version": "1.0.0",
+  "description": "抖音：下载无水印原画视频，转出逐字稿和要点",
+  "credential": { "label": "抖音", "required": false, "note": "大部分视频不登录也能下" },
+  "requires": { "commands": ["ffmpeg"], "python": ["playwright"] },
+  "uses": ["transcribe"],
+  "memory_mb": 600,
+  "sandbox": true
+}

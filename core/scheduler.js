@@ -440,7 +440,8 @@ const NIGHTLY_AT_MINUTE = (() => {
 })();
 const CHUNK_CHARS = Number(process.env.CLAWBOT_CONSOLIDATION_CHUNK_CHARS) || 12000;
 const MAX_CHUNKS = 8;
-const CONSOLIDATION_TIMEOUT_MS = Number(process.env.CLAWBOT_CONSOLIDATION_TIMEOUT_MS) || 300000;
+const CONSOLIDATION_TIMEOUT_MS = Number(process.env.CLAWBOT_CONSOLIDATION_TIMEOUT_MS) || 600000; // 平时每段 2~4 分钟，最慢的一次 4 分半
+const durationText = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.round(ms / 1000)} 秒`);
 let consolidationRunning = false;
 
 /**
@@ -549,8 +550,8 @@ ${partNote}
 3. 知识归档原则：
    - 核心全局偏好：合并到当前目录下的 MEMORY.md（现在 ${sizes.get('MEMORY.md') || 0} 字）；
 ${topicLines}
-4. 长度上限：MEMORY.md 不超过 ${MEMORY_MAX_CHARS} 字，每个专题分卷不超过 ${TOPIC_MAX_CHARS} 字。接近或超过上限时，先合并重复的条目、精简过时的内容，再写新内容。
-5. 修改原则：重复、过时的条目可以合并精简，但仍然有效的信息不能删除。如果昨日没有值得长期记住的新内容，就保持原样，不要为了修改而修改。
+4. 只改跟昨天聊天有关的条目：昨天没聊到的条目一个字都不要动，不要为了省字数去删字、换说法或合并别的条目（下面第 5 条的整条挪动除外）。被昨天的新信息取代的内容可以更新，仍然有效的信息不能删除。如果昨日没有值得长期记住的新内容，就保持原样，不要为了修改而修改。
+5. 长度：MEMORY.md 不超过 ${MEMORY_MAX_CHARS} 字，每个专题分卷不超过 ${TOPIC_MAX_CHARS} 字。MEMORY.md 放不下新内容时，把属于某个专题的一整条细节原样挪进对应的专题分卷（MEMORY.md 里留一句“详见某某分卷”）；没有合适的专题、或者专题分卷也满了，就照常写，超出一些没关系，不要为了控制字数删减已有内容。
 
 【当前 MEMORY.md 全文】：
 ${currentMemory}
@@ -644,10 +645,14 @@ export async function runNightlyConsolidation({ day } = {}) {
       recordAgentResult('scheduler', outcome);
       if (!outcome.ok) {
         result = 'failed';
-        // 只记退出码和错误输出的末尾，不用 err.message（里面是完整命令行）
+        // 超时：写明限时、停下之前写进去的改动都留着、后面还有几段没整理；
+        // 其他错误只记退出码和错误输出的末尾，不用 err.message（里面是完整命令行）
+        const rest = chunks.length - i - 1;
         const detail = outcome.kind === 'auth'
           ? outcome.reason
-          : String(stderr || '').trim().slice(-300) || `exit ${err?.code ?? err?.signal ?? 'status ERROR'}`;
+          : outcome.kind === 'timeout'
+            ? `超过 ${durationText(CONSOLIDATION_TIMEOUT_MS)}没整理完，已经停下${rest ? `，后面 ${rest} 段这次没整理` : ''}；停下之前写进去的改动都留着，早上的“记忆变动”里能看到`
+            : String(stderr || '').trim().slice(-300) || `exit ${err?.code ?? err?.signal ?? 'status ERROR'}`;
         console.error(`[睡眠记忆固化执行异常]${where}: ${detail}`);
         appendLog(`[睡眠记忆固化失败]${where}: ${detail}`);
         // 登录失效由"智能体登录失效"告警统一报，这里不再重复报一条
@@ -721,7 +726,7 @@ async function startScheduler() {
   const memoryNote = {
     owner: '记忆历史：定时检查所有实例的记忆改动并存版本，早间播报附上"记忆变动"',
     standalone: '记忆历史：定时检查本实例的记忆改动并存版本（data/memory-history/），早间播报附上"记忆变动"',
-    managed: '记忆变动：早间播报附上主人的机器人准备好的汇报',
+    managed: '改动汇报：早间播报附上管理服务准备好的汇报（记忆和设置的版本由管理服务统一存）',
     off: '记忆历史：没有开启（没装 git，或者设了 CLAWBOT_MEMORY_MODE=off）',
   }[MEMORY_MODE];
   console.log(` • ${memoryNote}`);
