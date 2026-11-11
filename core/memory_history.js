@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { listMemoryFiles, memoryLabel, charCount } from './memory_config.js';
+import { listMemoryFiles, memoryLabel, memoryKind, charCount, normalizeLine, DATE_TAG, LIBRARY_DIR, TOPICS_DIR } from './memory_config.js';
 import { writeJsonAtomic, loadBotSettings } from './wechat_reply.js';
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -274,9 +274,27 @@ const settingTooFresh = (botRoot, rel, now) => {
 // skip(rel) 为真的设置文件这一轮原样不动（刚改过、还没停下来）
 function syncToRepo(botRoot, repo, { only = null, skip = null } = {}) {
   const want = new Map();
+  // 读不出来（权限不对、变成了软链接、目录列不出来）不等于删掉了：这些文件历史里保留上一版，不记成删除
+  const keep = new Set();
+  const repoFiles = git(repo, ['ls-files']).split('\n').filter(Boolean);
   if (only !== 'settings') {
     for (const f of listMemoryFiles(botRoot)) {
-      try { want.set(f.rel, { buf: readBotFile(botRoot, f.abs) }); } catch {}
+      try {
+        want.set(f.rel, { buf: readBotFile(botRoot, f.abs) });
+      } catch (e) {
+        if (e.code === 'ENOENT') continue;
+        keep.add(f.rel);
+        console.warn(`[记忆历史] ${path.basename(botRoot)} 的 ${f.rel} 读不出来（${e.code || e.message}），这一版保留上次的内容`);
+      }
+    }
+    for (const dir of ['data/memory', TOPICS_DIR, 'data/memory/timeline', LIBRARY_DIR]) {
+      try {
+        fs.readdirSync(path.join(botRoot, dir));
+      } catch (e) {
+        if (e.code === 'ENOENT') continue;
+        for (const rel of repoFiles) if (rel.startsWith(`${dir}/`)) keep.add(rel);
+        console.warn(`[记忆历史] ${path.basename(botRoot)} 的 ${dir}/ 列不出来（${e.code || e.message}），里面的文件这一版保留上次的内容`);
+      }
     }
   }
   if (only !== 'memory') {
@@ -286,8 +304,8 @@ function syncToRepo(botRoot, repo, { only = null, skip = null } = {}) {
   }
   const untouched = (rel) => (only === 'memory' && !isMemoryRel(rel)) || (only === 'settings' && isMemoryRel(rel))
     || (!isMemoryRel(rel) && Boolean(skip?.(rel)));
-  for (const rel of git(repo, ['ls-files']).split('\n').filter(Boolean)) {
-    if (!want.has(rel) && !untouched(rel)) fs.rmSync(path.join(repo, rel), { force: true });
+  for (const rel of repoFiles) {
+    if (!want.has(rel) && !untouched(rel) && !keep.has(rel)) fs.rmSync(path.join(repo, rel), { force: true });
   }
   const repoReal = fs.realpathSync(repo);
   for (const [rel, f] of want) {
@@ -317,6 +335,10 @@ function recentlyModified(botRoot, now) {
 
 // 这一版是谁改的：实例自己的调度器在凌晨整理时会写 data/state/memory_consolidation.json
 function snapshotSource(botRoot, now) {
+  // 管理员做一次性迁移（memory_slim.js apply）时写 data/state/memory_migration.json：那之后半小时内存的版本算"一次性搬家"
+  // （机器人正在聊天、文件一直在动时，要等文件停下 2 分钟才存，可能晚好几分钟）
+  const mig = readJson(path.join(botRoot, 'data', 'state', 'memory_migration.json')) || {};
+  if (mig.at && now - mig.at < 30 * 60_000) return '一次性搬家';
   const st = readJson(path.join(botRoot, 'data', 'state', 'memory_consolidation.json')) || {};
   const running = st.running && now - (st.started_at || 0) < 2 * 3600_000;
   if (running || (st.finished_at && now - st.finished_at < NIGHT_GRACE_MS)) return '凌晨整理';
@@ -381,7 +403,8 @@ function hunkLines(hunk) {
   };
 }
 
-const cleanLine = (line) => String(line).trim()
+// 汇报里显示的一行：去掉列表符号、标题符号、加粗、行内代码记号和末尾的日期标记〔11-05〕
+const cleanLine = (line) => String(line).replace(DATE_TAG, '').trim()
   .replace(/^(?:[-*+•]|\d+[.)、]|#{1,6})\s+/, '')
   .replace(/\*\*([^*]+)\*\*/g, '$1')
   .replace(/`([^`]+)`/g, '$1')
@@ -406,19 +429,55 @@ function diffItems(botRoot, from, to) {
     if (!showCache.has(key)) showCache.set(key, (git(repo, ['show', `${c}:${rel}`], { allowFail: true }) ?? '').split('\n'));
     return showCache.get(key);
   };
+  // 腾地方时条目搬到了哪：to 那一版的资料库（核心档案的条目还可能搬进专题）
+  let destLines = null;
+  const destination = () => {
+    if (destLines === null) {
+      const files = git(repo, ['ls-tree', '-r', '--name-only', to, '--', LIBRARY_DIR, TOPICS_DIR]).split('\n').filter(Boolean);
+      destLines = new Set(files.flatMap((f) => (git(repo, ['show', `${to}:${f}`], { allowFail: true }) ?? '').split('\n').map(normalizeLine)));
+    }
+    return destLines;
+  };
   const items = [];
   for (const rel of git(repo, ['diff', '--name-only', from, to]).split('\n').filter(Boolean)) {
     if (!isMemoryRel(rel)) continue;
     const { hunks } = parsePatch(filePatch(repo, from, to, rel));
     const commits = git(repo, ['rev-list', '--reverse', `${from}..${to}`, '--', rel]).split('\n').filter(Boolean);
+    const kind = memoryKind(rel);
+    if (kind === 'library' || kind === 'timeline') {
+      // 资料库、大事记按文件算一条（只往里加，逐段列太碎）；撤销时整个文件退回改之前
+      const all = hunks.map(hunkLines);
+      const added = all.flatMap((h) => h.added);
+      const removed = all.flatMap((h) => h.removed);
+      if (!visible(added).length && !visible(removed).length) continue;
+      const existed = git(repo, ['cat-file', '-e', `${from}:${rel}`], { allowFail: true }) !== null;
+      const last = commits[commits.length - 1];
+      items.push({ bot, rel, from, to, hunk: -1, label: memoryLabel(botRoot, rel), added, removed, source: last ? subjectOf(repo, last) : '', kind: 'file', files: [rel], created: !existed });
+      continue;
+    }
     hunks.forEach((h, i) => {
       const { added, removed } = hunkLines(h);
-      if (!visible(added).length && !visible(removed).length) return;
+      // 去掉日期标记〔11-05〕后两边都有的行不算改动；只改了日期或空白的段不列
+      const rest = (a, b) => {
+        const pool = [...b];
+        return a.filter((l) => {
+          const i = pool.indexOf(l);
+          if (i < 0) return true;
+          pool.splice(i, 1);
+          return false;
+        });
+      };
+      const addOnly = rest(visible(added), visible(removed));
+      const delOnly = rest(visible(removed), visible(added));
+      if (!addOnly.length && !delOnly.length) return;
       // 来源：新内容的第一行最早出现在哪一版；纯删除看旧内容的第一行最早消失在哪一版
       const probe = added.find((l) => l.trim());
       const gone = probe === undefined ? removed.find((l) => l.trim()) : undefined;
       const c = commits.find((x) => (probe !== undefined ? contentAt(x, rel).includes(probe) : !contentAt(x, rel).includes(gone)));
-      items.push({ bot, rel, from, to, hunk: i, label: memoryLabel(botRoot, rel), added, removed, source: c ? subjectOf(repo, c) : '' });
+      // 删掉的每一行都原样出现在资料库（或专题）里、最多只加了一句结论：这是"搬走"，不是删除
+      const moved = delOnly.length > 0 && addOnly.length <= 1
+        && removed.filter((l) => !/^\s*#/.test(l) && delOnly.includes(cleanLine(l))).every((l) => destination().has(normalizeLine(l)));
+      items.push({ bot, rel, from, to, hunk: i, label: memoryLabel(botRoot, rel), added, removed, source: c ? subjectOf(repo, c) : '', moved, movedLines: moved ? delOnly : null, keptSummary: moved && addOnly.length > 0 });
     });
   }
   return [...items, ...settingItems(botRoot, from, to)];
@@ -604,6 +663,10 @@ function blockText(b, max) {
 function itemParts(item) {
   const add = visible(item.added);
   const del = visible(item.removed);
+  if (item.moved) {
+    const m = item.movedLines;
+    return { kind: '搬走', key: '', body: `「${clip(m[0], 30)}」${m.length > 1 ? `等 ${m.length} 行` : ''}原样搬去了资料库${item.keptSummary ? '，原处留了一句结论' : ''}`, lines: 0, more: 0 };
+  }
   if (!del.length) return { kind: '新增', key: '', body: clip(add[0], 40), lines: add.length, more: 0 };
   if (!add.length) return { kind: '删除', key: '', body: clip(del[0], 40), lines: del.length, more: 0 };
   const lines = Math.max(add.length, del.length);
@@ -626,8 +689,33 @@ function itemLine(item) {
   return `${item.n}. ${p.kind}｜${item.label}${p.key ? `「${p.key}」` : ''}${item.source ? `（${item.source}）` : ''}：${p.body}${itemSuffix(p)}`;
 }
 
+// 资料库、大事记按文件算的一条
+function fileParts(item) {
+  const add = visible(item.added);
+  const del = visible(item.removed);
+  const verb = item.created ? '新增' : !add.length ? '删除' : '更新';
+  const body = add.length ? `加了 ${add.length} 行，比如「${clip(add[0], 30)}」` : `删了 ${del.length} 行`;
+  return { verb, body };
+}
+function fileLine(item) {
+  const p = fileParts(item);
+  return `${item.n}. ${p.verb}｜${item.label}${item.source ? `（${item.source}）` : ''}：${p.body}`;
+}
+function fileDetail(item) {
+  const add = visible(item.added);
+  return [
+    ...add.slice(0, 6).map((l) => `   ＋ ${clip(l, 100)}`),
+    ...(add.length > 6 ? [`   …一共加了 ${add.length} 行`] : []),
+    ...visible(item.removed).slice(0, 3).map((l) => `   － ${clip(l, 100)}`),
+  ];
+}
+
 // 给被代管实例的用户看的一行：不编号、不写来源
 function plainItemLine(item) {
+  if (item.kind === 'file') {
+    const f = fileParts(item);
+    return `• ${f.verb}｜${item.label}：${f.body}`;
+  }
   const p = itemParts(item);
   return `• ${p.kind}｜${item.label}${p.key ? `「${p.key}」` : ''}：${p.body}${itemSuffix(p)}`;
 }
@@ -699,20 +787,55 @@ function botItems(botRoot, from) {
   return { items, range: { from: start, to } };
 }
 
+// 超上限的核心档案和专题：如实说聊天时有没有被截断、晚上会怎么处理（资料库、大事记没有上限）
 function overLimitNotes(botRoot) {
   const notes = [];
   for (const f of listMemoryFiles(botRoot)) {
+    if (!Number.isFinite(f.max)) continue;
     let n = 0;
-    try { n = charCount(fs.readFileSync(f.abs, 'utf-8')); } catch { continue; }
-    if (n > f.max) notes.push(`⚠️ ${displayName(botRoot)}的「${f.label}」${n} 字，超过上限 ${f.max} 字。${f.rel === 'MEMORY.md' ? '凌晨整理会把能归到专题的整条细节挪过去，' : '照常整份带上（超过两倍才截断），'}不会为了省字删内容。`);
+    try { n = charCount(readBotFile(botRoot, f.abs).toString('utf-8')); } catch { continue; }
+    if (n <= f.max) continue;
+    const cut = n > f.max * 2 ? `聊天时只带得上前 ${f.max * 2} 字，` : '';
+    notes.push(`⚠️ ${displayName(botRoot)}的「${f.label}」${n} 字，超过上限 ${f.max} 字。${cut}凌晨整理会把旧的、细节的条目原样搬去资料库（一晚整理一个文件），内容不会丢。`);
   }
   return notes;
 }
 
+// 汇报起点以来的"腾地方"：从实例自己的 data/state/memory_slim.json 读（只读数字和文件名，路径经过软链接不读）
+function slimNotes(botRoot, since) {
+  let entries = [];
+  try {
+    entries = JSON.parse(readBotFile(botRoot, path.join(botRoot, 'data', 'state', 'memory_slim.json')).toString('utf-8')).entries;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(entries)) return [];
+  // 同一个文件可能分几次搬（比如一次性迁移搬了两轮）：合成一行，写"原来多少字、现在多少字、一共搬了几条去哪"
+  const byFile = new Map();
+  for (const e of entries.filter((x) => x && Number(x.at) > (since || 0)).sort((a, b) => Number(a.at) - Number(b.at))) {
+    const rel = String(e.rel || '');
+    const g = byFile.get(rel) || { label: '', before: Number(e.before) || 0, count: 0, dests: new Set() };
+    g.label = String(e.label || rel);
+    for (const m of Array.isArray(e.moved) ? e.moved : []) {
+      g.count += Number(m?.count) || 0;
+      g.dests.add(String(m?.to || '').replace(`${LIBRARY_DIR}/`, '').replace(`${TOPICS_DIR}/`, '专题 '));
+    }
+    byFile.set(rel, g);
+  }
+  return [...byFile].slice(0, 8).map(([rel, g]) => {
+    let now = null;
+    try { now = charCount(readBotFile(botRoot, path.join(botRoot, rel)).toString('utf-8')); } catch {}
+    const dests = [...g.dests];
+    return `🗂 「${clip(g.label, 20)}」腾地方：原来 ${g.before} 字，${now === null ? '' : `现在 ${now} 字，`}一共 ${g.count} 条原样搬去了 ${clip(dests.slice(0, 3).join('、'), 60)}${dests.length > 3 ? ' 等' : ''}，需要时还能查到。`;
+  });
+}
+
 // 存进 review.json 的清单只留定位用的字段，不存内容
 const storedItem = ({ n, bot, rel, from, to, hunk, label, botName, kind, files }) => ({ n, bot, rel, from, to, hunk, label, botName, kind, files });
-const lineOf = (it) => (it.kind === 'setting' ? settingLine(it) : itemLine(it));
-const detailOf = (it) => (it.kind === 'setting' ? settingDetail(it) : itemDetail(it));
+const lineOf = (it) => (it.kind === 'setting' ? settingLine(it) : it.kind === 'file' ? fileLine(it) : itemLine(it));
+const detailOf = (it) => (it.kind === 'setting' ? settingDetail(it) : it.kind === 'file' ? fileDetail(it) : itemDetail(it));
+// 整个文件退回改之前（设置、资料库、大事记）；其余按段反向打补丁
+const fileLevel = (it) => it.kind === 'setting' || it.kind === 'file';
 
 // 带编号的汇报：记忆在前、设置在后，编号接着排；notes 附在后面（超长提醒、别的机器人有设置变动）
 function numberedDigestText(items, since, notes = []) {
@@ -720,7 +843,7 @@ function numberedDigestText(items, since, notes = []) {
   const set = items.filter((i) => i.kind === 'setting');
   const lines = [];
   if (mem.length) {
-    lines.push(`📝 记忆变动（${sinceText(since)} 以来）`, ...mem.slice(0, DIGEST_MAX_ITEMS).map(itemLine));
+    lines.push(`📝 记忆变动（${sinceText(since)} 以来）`, ...mem.slice(0, DIGEST_MAX_ITEMS).map(lineOf));
     if (mem.length > DIGEST_MAX_ITEMS) lines.push(`还有 ${mem.length - DIGEST_MAX_ITEMS} 条，回「记忆改动」看全部。`);
   }
   if (set.length) {
@@ -764,7 +887,7 @@ export function buildDigest({ botsDir = DEFAULT_BOTS_DIR, bot }) {
     const { items, range } = botItems(botRoot, state.reported?.[bot]);
     if (!items.length) return null;
     const since = state.reported_at?.[bot] || commitTime(repoDir(bot), range.from);
-    return { bot, text: numberedDigestText(items, since, overLimitNotes(botRoot)), items: items.map(storedItem), range };
+    return { bot, text: numberedDigestText(items, since, [...slimNotes(botRoot, since), ...overLimitNotes(botRoot)]), items: items.map(storedItem), range };
   });
 }
 
@@ -804,7 +927,7 @@ export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot, viewer = null }) 
     for (const it of items) {
       const detail = detailOf(it);
       // 记忆那几条的摘要就是下面的细节，标题里去掉；设置的摘要（改了几行、装上了官方技能）留着
-      const block = [it.kind === 'setting' ? settingLine(it) : itemLine(it).replace(/：.*$/, ''), ...detail.slice(0, 4)];
+      const block = [it.kind === 'setting' ? settingLine(it) : lineOf(it).replace(/：.*$/, ''), ...detail.slice(0, 4)];
       if (detail.length > 4) block.push(`   …（共 ${detail.length} 行）`);
       const text = block.join('\n');
       if (used + text.length > LIST_MAX_CHARS) {
@@ -838,11 +961,12 @@ export function showChanges({ botsDir = DEFAULT_BOTS_DIR, bot, viewer = null }) 
 const pendingFile = (botRoot) => path.join(botRoot, 'data', 'state', 'memory_digest.json');
 const ackFile = (botRoot) => path.join(botRoot, 'data', 'state', 'memory_digest_ack.json');
 
-function plainDigestText(items, since, botName) {
+function plainDigestText(items, since, botName, notes = []) {
   // 只列记忆：设置是用户当面让机器人改的，改的时候已经说过了；管理员在自己那边看得到
   items = items.filter((i) => i.kind !== 'setting');
   const lines = [`📝 记忆变动（${sinceText(since)} 以来）`, ...items.slice(0, DIGEST_MAX_ITEMS).map(plainItemLine)];
   if (items.length > DIGEST_MAX_ITEMS) lines.push(`另外还有 ${items.length - DIGEST_MAX_ITEMS} 条小改动，就不一一列了。`);
+  lines.push(...notes);
   lines.push(`哪里记得不对，直接告诉${botName}是哪件事就行～`);
   return lines.join('\n');
 }
@@ -911,9 +1035,9 @@ export function syncBotDigests({ botsDir = DEFAULT_BOTS_DIR, includeOwner = fals
       const since = state.reported_at?.[bot] || commitTime(repo, from);
       const pointerLines = pointers.map((p) => `（${p.name}有 ${p.n} 处设置变动，回「${p.name}改动」看）`);
       let text;
-      if (!numbered) text = plainDigestText(items, since, displayName(botRoot));
+      if (!numbered) text = plainDigestText(items, since, displayName(botRoot), slimNotes(botRoot, since));
       else if (!items.length) text = pointers.map((p) => `📝 ${p.name}有 ${p.n} 处设置变动，回「${p.name}改动」看。`).join('\n');
-      else text = numberedDigestText(items, since, [...overLimitNotes(botRoot), ...pointerLines]);
+      else text = numberedDigestText(items, since, [...slimNotes(botRoot, since), ...overLimitNotes(botRoot), ...pointerLines]);
       writeJsonForBot(botRoot, file, { id, at: Date.now(), count: listed.length, text });
       // 只留最近几份的范围：回执可能对应稍早写的那一份
       const entry = { from, to, ...(numbered ? { items: items.map(storedItem) } : {}), ...(pointers.length ? { pointed: Object.fromEntries(pointers.map((p) => [p.bot, p.to])) } : {}) };
@@ -993,7 +1117,7 @@ export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR, viewer = null
     if (todo.length) {
       snapshotAllUnlocked(botsDir, { force: true });
       // 同一个文件从后往前撤，前面那些段的行号不受影响
-      const order = todo.filter((i) => i.kind !== 'setting').sort((a, b) => a.bot.localeCompare(b.bot) || a.rel.localeCompare(b.rel) || b.hunk - a.hunk);
+      const order = todo.filter((i) => !fileLevel(i)).sort((a, b) => a.bot.localeCompare(b.bot) || a.rel.localeCompare(b.rel) || b.hunk - a.hunk);
       const touched = new Map();
       for (const it of order) {
         const repo = repoDir(it.bot);
@@ -1010,8 +1134,8 @@ export function undoItems(selection, { botsDir = DEFAULT_BOTS_DIR, viewer = null
         if (!touched.has(it.bot)) touched.set(it.bot, new Set());
         touched.get(it.bot).add(it.rel);
       }
-      // 设置按项整个退回改之前的样子（新增的就删掉）；那一项后来又改过就不硬改
-      for (const it of todo.filter((i) => i.kind === 'setting')) {
+      // 设置按项、资料库和大事记按文件，整个退回改之前的样子（新增的就删掉）；后来又改过就不硬改
+      for (const it of todo.filter(fileLevel)) {
         const repo = repoDir(it.bot);
         const unchanged = isCommit(repo, it.from) && isCommit(repo, it.to)
           && (it.files || []).every((rel) => git(repo, ['diff', '--quiet', it.to, 'HEAD', '--', rel], { allowFail: true }) !== null);

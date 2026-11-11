@@ -18,9 +18,9 @@
     ├── inbox/           # 收件箱：pending/ 待处理、processing/ 处理中、failed/ 反复出错需人工查看
     ├── state/           # 运行状态：同步进度、会话、调度器心跳、微信窗口、智能体调用结果、凌晨整理进度
     ├── alerts/          # 待发送的告警事件，监控读完就删
-    ├── memory/topics/   # 专题分卷
+    ├── memory/          # 记忆：topics/ 专题、library/ 资料库、timeline/ 按月的大事记
     ├── memory-history/  # 记忆历史（git 库）和汇报进度
-    ├── history/         # 按天的聊天记录（保留 30 天），凌晨整理用
+    ├── history/         # 按天的聊天记录（保存一年），凌晨整理用
     ├── chat_history.log # 聊天总记录（超过 3MB 自动截掉前一半）
     ├── reminders.json   # 随口提醒
     └── downloads/       # 下载的视频和文件，按平台分类

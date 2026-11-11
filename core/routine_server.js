@@ -33,7 +33,10 @@ import {
   requeueProcessing,
   messageIdFromFileName,
 } from './inbox.js';
-import { RESET_MARKER, loadTopicsConfig, capForLoading, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS, TOPIC_ALWAYS_BUDGET } from './memory_config.js';
+import {
+  RESET_MARKER, isResetEntry, loadTopicsConfig, capForLoading, charCount, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS,
+  MAX_TOPICS_PER_MESSAGE, TIMELINE_LOAD_MAX_CHARS, LIBRARY_DIR, TIMELINE_DIR,
+} from './memory_config.js';
 import { memoryMode, useStandaloneHistory, parseMemoryCommand, findBotByName, showChanges, undoItems } from './memory_history.js';
 import { parseCredentialCommand, saveSkillCredential, credentialHelp, isInstalled } from './skills.js';
 import { raiseAlert } from './alert.js';
@@ -463,7 +466,8 @@ function formatFriendlyError(execErr, botName, userNickname) {
   }
   // 2. 限流 / 429 / 频控
   if (/429|RESOURCE_EXHAUSTED|rate limit|quota/i.test(msg)) {
-    return `${userNickname}，当前对话节奏较快，触发了保护频控～请给【${botName}】半分钟缓冲时间，马上恢复！`;
+    // 可能只是发得太快，也可能是智能体的用量到了上限（要等好几个小时）：不承诺"马上恢复"
+    return `${userNickname}，智能体这会儿触发了用量或频率限制，这次没处理成，请稍后再发我一次试试～`;
   }
   // 3. 超时 / 耗时过长
   if (/stream idle timeout|context deadline exceeded|timeout|SIGTERM/i.test(msg)) {
@@ -475,10 +479,10 @@ function formatFriendlyError(execErr, botName, userNickname) {
   }
   // 5. 进程退出或通用错误（完全过滤掉 exit 1、JSON、模型代号）
   if (/exit 1|exit [0-9]|status ERROR|Agent processing failed/i.test(msg)) {
-    return `${userNickname}，刚才处理这段内容时遇到了意外中断，【${botName}】已为您自动重置环境。您可以换个更简洁的问法随时发我重新处理～`;
+    return `${userNickname}，刚才处理这段内容时中断了，这次没处理成。您换个更简洁的问法，或者稍后再发我一次试试～`;
   }
-  // 6. 其他未知异常保底脱敏
-  return `${userNickname}，刚才的任务在后台处理遇到了临时波动，【${botName}】已自动调整完毕，您可以稍候重试～`;
+  // 6. 其他未知异常保底脱敏（只说没处理成，不说程序没做过的事）
+  return `${userNickname}，刚才的任务没处理成，您稍后再发我一次试试～`;
 }
 
 // 自动发过的媒体：同一个文件（路径 + 修改时间 + 大小）1 小时内只自动发一次。后台任务的结果和接着问的一句常会提到同一个文件，
@@ -597,7 +601,8 @@ function parseTurnsFromLog(filePath, maxTurns = 10) {
       const block = lines[i].trim();
       if (!block) continue;
 
-      if (block.includes(RESET_MARKER)) {
+      // 只有整条日志就是重置标记才算；用户在聊天里引用"[会话已重置]"这几个字不算
+      if (isResetEntry(block)) {
         return { turns: parsedTurns, hitReset: true };
       }
       if (block.includes('[后台接管预告]')) {
@@ -707,37 +712,93 @@ function cleanOldRequests() {
 }
 
 /**
- * 加载当前 Bot 的专题分卷：小专题每条消息都带（从小到大放，合计不超过 TOPIC_ALWAYS_BUDGET 字）；
- * 放不下的大专题，这条消息或之前两条用户消息里提到关键词才带，聊着聊着不会突然丢掉。
+ * 加载当前 Bot 的专题：这条消息或之前两条用户消息里提到关键词才带（聊着聊着不会突然丢掉），
+ * 每条消息最多带 MAX_TOPICS_PER_MESSAGE 本：这条消息提到的优先，关键词命中多的优先。
+ * 提到了但没带上的，告诉智能体文件在哪，需要时自己读。
  * 专题和关键词写在各实例自己的 topics.json 里，核心代码不写死任何个人信息。
  */
 function loadTopicMemory(messageText) {
   const topicsDir = path.join(botRoot, 'data', 'memory', 'topics');
-  const topics = [];
+  const current = String(messageText || '').toLowerCase();
+  const earlier = recentUserTexts(2, messageText).join('\n').toLowerCase();
+  const hits = [];
   for (const topic of loadTopicsConfig(botRoot)) {
-    try {
-      const content = fs.readFileSync(path.join(topicsDir, topic.file), 'utf-8').trim();
-      if (content) topics.push({ ...topic, content, size: [...content].length });
-    } catch {}
+    const now = topic.keywords.filter((k) => matchesKeyword(current, k)).length;
+    const before = now ? 0 : topic.keywords.filter((k) => matchesKeyword(earlier, k)).length;
+    if (!now && !before) continue;
+    let content = '';
+    try { content = fs.readFileSync(path.join(topicsDir, topic.file), 'utf-8').trim(); } catch {}
+    if (content) hits.push({ ...topic, content, score: now * 100 + before });
   }
-  if (!topics.length) return '';
+  if (!hits.length) return '';
+  const ranked = [...hits].sort((a, b) => b.score - a.score);
+  const chosen = ranked.slice(0, MAX_TOPICS_PER_MESSAGE);
+  const sections = chosen.map((t) => {
+    const { text: content, truncated } = capForLoading(t.content, TOPIC_MAX_CHARS);
+    if (truncated) console.warn(`[专题分卷] ${t.file} 超过上限太多，这次只带了前 ${TOPIC_MAX_CHARS * 2} 字`);
+    return `【${t.name} (${t.file})】：\n${content}`;
+  });
+  const left = ranked.slice(MAX_TOPICS_PER_MESSAGE);
+  if (left.length) {
+    sections.push(`（这次也提到了${left.map((t) => `「${t.name}」`).join('')}，没有带上；需要时读 ${left.map((t) => `data/memory/topics/${t.file}`).join('、')}）`);
+  }
+  return `\n\n${sections.join('\n\n')}\n`;
+}
 
-  const always = new Set();
-  let used = 0;
-  for (const t of [...topics].sort((a, b) => a.size - b.size)) {
-    if (used + t.size > TOPIC_ALWAYS_BUDGET) break;
-    always.add(t.file);
-    used += t.size;
+// 问到以前的事（上个月、那天、几月几号……）才带大事记：提到某个月份就先带那个月，再从最近的月份往前补，合计不超过 TIMELINE_LOAD_MAX_CHARS 字
+const TIME_QUESTION = /上上?个?月|上上?周|上个?星期|上次|那天|那次|当时|前几天|前阵子|前段时间|去年|几号|哪天|哪一天|什么时候|多久以前|(?:之前|以前)(?:说|聊|讲|定|提|问|做)|\d{1,2}\s*月\s*\d{1,2}\s*[日号]|\d{1,2}\s*月份/;
+function loadTimeline(messageText) {
+  const text = String(messageText || '');
+  if (!TIME_QUESTION.test(text)) return '';
+  let files = [];
+  try {
+    files = fs.readdirSync(path.join(botRoot, TIMELINE_DIR)).filter((f) => /^\d{4}-\d{2}\.md$/.test(f)).sort().reverse();
+  } catch {
+    return '';
   }
-  const text = [messageText || '', ...recentUserTexts(2, messageText)].join('\n').toLowerCase();
-  const sections = topics
-    .filter((t) => always.has(t.file) || t.keywords.some((k) => matchesKeyword(text, k)))
-    .map((t) => {
-      const { text: content, truncated } = capForLoading(t.content, TOPIC_MAX_CHARS);
-      if (truncated) console.warn(`[专题分卷] ${t.file} 超过上限太多，这次只带了前 ${TOPIC_MAX_CHARS * 2} 字`);
-      return `【${t.name} (${t.file})】：\n${content}`;
-    });
-  return sections.length ? `\n\n${sections.join('\n\n')}\n` : '';
+  if (!files.length) return '';
+  const month = text.match(/(\d{1,2})\s*月/);
+  if (month) {
+    const mm = `-${String(Number(month[1])).padStart(2, '0')}.md`;
+    const hit = files.find((f) => f.endsWith(mm));
+    if (hit) files = [hit, ...files.filter((f) => f !== hit)];
+  }
+  const parts = [];
+  let left = TIMELINE_LOAD_MAX_CHARS;
+  for (const f of files) {
+    if (left <= 200) break;
+    let content = '';
+    try { content = fs.readFileSync(path.join(botRoot, TIMELINE_DIR, f), 'utf-8').trim(); } catch {}
+    if (!content) continue;
+    const chars = [...content];
+    // 一个月的太长：只带最近的部分
+    const piece = chars.length > left ? `…（前面省略）\n${chars.slice(chars.length - left).join('')}` : content;
+    parts.push(`[${f.replace(/\.md$/, '')}]\n${piece}`);
+    left -= Math.min(chars.length, left);
+  }
+  return parts.length ? `\n\n【大事记（data/memory/timeline/，按月）】：\n${parts.join('\n\n')}\n` : '';
+}
+
+// 资料库里有哪些（只列目录和文件数，不带内容）：让智能体知道去哪查细节
+function libraryHint() {
+  const root = path.join(botRoot, LIBRARY_DIR);
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return ''; }
+  const shelves = [];
+  let loose = 0;
+  for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (e.name.startsWith('.')) continue;
+    if (e.isDirectory()) {
+      let n = 0;
+      try { n = fs.readdirSync(path.join(root, e.name)).filter((f) => f.endsWith('.md')).length; } catch {}
+      if (n) shelves.push(`${e.name}/（${n} 个文件）`);
+    } else if (e.isFile() && e.name.endsWith('.md')) {
+      loose++;
+    }
+  }
+  if (loose) shelves.push(`另有 ${loose} 个文件`);
+  if (!shelves.length) return '';
+  return `\n\n（资料库 ${LIBRARY_DIR}/：${shelves.slice(0, 12).join('、')}${shelves.length > 12 ? ' 等' : ''}。专题里写着"细节见资料库…"或回答需要细节时，用文件工具去读；以前聊天的原话在 data/history/，按天保存一年。）\n`;
 }
 
 /**
@@ -760,11 +821,14 @@ function loadBotMemory(messageText = '') {
     }
   }
 
-  // 2. 专题分卷：小的常驻，大的按关键词（这条消息和之前两条）
+  // 2. 专题：按关键词（这条消息和之前两条），最多两本
   const topicContent = loadTopicMemory(messageText);
   if (topicContent) {
     result += topicContent;
   }
+  // 3. 问到以前的事才带大事记；资料库只说有哪些，不带内容
+  result += loadTimeline(messageText);
+  result += libraryHint();
 
   return result;
 }
@@ -967,7 +1031,7 @@ async function handleWechatTask(task) {
   const withConversationNotice = (res, text) => (res.resumeFailed ? `${text}\n\n${CONVERSATION_LOST_NOTICE}` : text);
   const memorySection = loadBotMemory(message_text);
   const recentChatSection = getRecentChatContext(5);
-  const fullMessage = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住长期偏好、习惯或专业知识，请主动更新沉淀到当前目录的 MEMORY.md 或 data/memory/topics/ 对应专题分卷中（MEMORY.md 不超过 ${MEMORY_MAX_CHARS} 字，每个专题分卷不超过 ${TOPIC_MAX_CHARS} 字，写之前先看有没有重复的条目）。]${memorySection}${recentChatSection}\n[微信用户 ${userNickname}]: ${message_text}`;
+  const fullMessage = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住什么，按规则第 8 节记：每次聊天都用得上的写进 MEMORY.md（不超过 ${MEMORY_MAX_CHARS} 字），某个领域的结论写进 data/memory/topics/ 对应专题（每本不超过 ${TOPIC_MAX_CHARS} 字），资料原文放 data/memory/library/；同一件事改原来那一条，不要另加一条。]${memorySection}${recentChatSection}\n[微信用户 ${userNickname}]: ${message_text}`;
 
   // 标记活跃后台任务
   activeBackgroundTasks.add(taskKey);

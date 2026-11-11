@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { sendWechatReply, loadConfig, loadRuntimeState, saveRuntimeState, describeText, writeJsonAtomic } from './wechat_reply.js';
 import { loadTopicsConfig, textAfterLastReset, listMemoryFiles, capForLoading, charCount, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS } from './memory_config.js';
+import { prepareWorkCopy, discardWorkCopy, collectChanges, checkChanges, applyChanges, slimFile, overLimitFiles, agyPlanAgent } from './memory_slim.js';
 import { memoryMode, useStandaloneHistory, snapshotAll, buildDigest, markDigestDelivered, syncBotDigests } from './memory_history.js';
 import { raiseAlert } from './alert.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
@@ -366,7 +367,8 @@ async function deliverDueReminders() {
   // 现写的提醒可能要等智能体一两分钟：同一轮到点的普通提醒先发
   const order = reminders.map((item, i) => [i, item]).sort(([, a], [, b]) => Boolean(a.ai) - Boolean(b.ai));
   for (const [i, item] of order) {
-    if (item.target_time_ms && now >= item.target_time_ms) {
+    // 上次没发出去、在等重试的，没到重试时间先留着
+    if (item.target_time_ms && now >= item.target_time_ms && !(item.retry_at && now < item.retry_at)) {
       // 安全隔离防护：如果指定了 user_id 但不是当前实例绑定的微信用户，则跳过不处理，防止串号
       if (item.user_id && config.authorized_user_id && item.user_id !== config.authorized_user_id) {
         console.warn(`[动态提醒隔离拦截]: 任务用户 ${item.user_id} 非本实例绑定用户 ${config.authorized_user_id}，跳过处理`);
@@ -391,9 +393,11 @@ async function deliverDueReminders() {
         const late = item.held_by_window
           ? `\n（这条提醒原本是 ${shortTime(item.target_time_ms)} 的，当时${userNickname}太久没发消息，微信不让${config.bot_name || '小助理'}主动发，现在补上。）`
           : '';
-        const body = item.ai
-          ? await aiReminderText(item, dueLabel, userNickname)
-          : { text: `🔔 ${userNickname}，提醒到啦：${item.content}`, note: '' };
+        const body = item.prepared_text
+          ? { text: item.prepared_text, note: '' }
+          : item.ai
+            ? await aiReminderText(item, dueLabel, userNickname)
+            : { text: `🔔 ${userNickname}，提醒到啦：${item.content}`, note: '' };
         const nudge = withReplyNudge(`${body.text}${late}`, config);
         try {
           await sendWechatReply(toUser, ctxToken, nudge.text, config);
@@ -408,8 +412,15 @@ async function deliverDueReminders() {
             remaining.push([i, { ...item, held_by_window: true }]);
             continue;
           }
+          // 网络之类的临时错误：留着，过一会儿再发（现写的提醒把写好的文字存下来，重试不再调用智能体）；试够次数才放弃并告警
+          const tries = (item.send_failures || 0) + 1;
+          if (tries < REMINDER_MAX_TRIES) {
+            console.warn(`[动态提醒发送失败，${Math.round(REMINDER_RETRY_MS / 60000)} 分钟后重试（第 ${tries} 次）]:`, e.message);
+            remaining.push([i, { ...item, send_failures: tries, retry_at: Date.now() + REMINDER_RETRY_MS, ...(item.ai ? { prepared_text: body.text } : {}) }]);
+            continue;
+          }
           console.error(`❌ [动态提醒发送失败]:`, e.message);
-          raiseAlert('reminder_failed', `一条 ${dueLabel} 的提醒没发出去：${e.message}`);
+          raiseAlert('reminder_failed', `一条 ${dueLabel} 的提醒没发出去（试了 ${tries} 次）：${e.message}`);
         }
       } else {
         console.warn(`[动态提醒跳过]: 缺少 authorized_user_id 或 context_token`);
@@ -442,32 +453,40 @@ const CHUNK_CHARS = Number(process.env.CLAWBOT_CONSOLIDATION_CHUNK_CHARS) || 120
 const MAX_CHUNKS = 8;
 const CONSOLIDATION_TIMEOUT_MS = Number(process.env.CLAWBOT_CONSOLIDATION_TIMEOUT_MS) || 600000; // 平时每段 2~4 分钟，最慢的一次 4 分半
 const durationText = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.round(ms / 1000)} 秒`);
+// 03:00 之后这么久之内都可以开始或补跑（失败了隔 15 分钟重试，一天最多试 3 次）；进度记在 data/state/memory_consolidation.json
+const NIGHT_WINDOW_MIN = Number(process.env.CLAWBOT_NIGHT_WINDOW_MIN) || 180;
+const MAX_ATTEMPTS = 3;
+const RETRY_AFTER_MS = Number(process.env.CLAWBOT_CONSOLIDATION_RETRY_MS) || 15 * 60_000;
+// 按天的聊天日志保存多久（平时不加载，只在要找"当时原话"时搜）
+const LOG_KEEP_DAYS = Number(process.env.CLAWBOT_LOG_KEEP_DAYS) || 365;
+// 一次性提醒发送失败（不是微信窗口关了那种）：隔几分钟重试，最多试几次
+const REMINDER_RETRY_MS = Number(process.env.CLAWBOT_REMINDER_RETRY_MS) || 2 * 60_000;
+const REMINDER_MAX_TRIES = Number(process.env.CLAWBOT_REMINDER_MAX_TRIES) || 5;
 let consolidationRunning = false;
 
+function consolidationState() {
+  try { return loadRuntimeState('memory_consolidation'); } catch { return {}; }
+}
+
 /**
- * 凌晨 03:00 自动执行【类人脑睡眠记忆固化与反思】(Nightly Memory Consolidation)
- * 分段整理可能要跑好几分钟，放在后台跑，不卡调度循环（心跳、定时任务、提醒照常）。
+ * 凌晨 03:00 起整理昨天的聊天（Nightly Memory Consolidation）。
+ * 放在后台跑，不卡调度循环（心跳、定时任务、提醒照常）。失败了自动重试，从没整理完的那一段接着来；服务重启后也能接上。
  */
 async function checkNightlyMemoryConsolidation() {
+  if (consolidationRunning) return;
   const info = getBeijingInfo();
-  // 每天凌晨 03:00 ~ 03:05 触发
   const minuteOfDay = info.hour * 60 + info.minute;
-  if (minuteOfDay < NIGHTLY_AT_MINUTE || minuteOfDay > NIGHTLY_AT_MINUTE + 5) return;
+  if (minuteOfDay < NIGHTLY_AT_MINUTE || minuteOfDay > NIGHTLY_AT_MINUTE + NIGHT_WINDOW_MIN) return;
 
-  const state = loadState();
-  if (!state.last_fired) state.last_fired = {};
-  const todayStr = info.dateStr;
-
-  if (state.last_fired['nightly_memory_consolidation'] === todayStr || consolidationRunning) {
-    return;
+  const day = getBeijingInfo(new Date(Date.now() - 86400000)).dateStr;
+  const st = consolidationState();
+  if (st.day === day) {
+    if (st.result === 'ok' || st.result === 'skipped' || (st.attempts || 0) >= MAX_ATTEMPTS) return;
+    if (st.next_try_at && Date.now() < st.next_try_at) return;
   }
 
-  // 立即标记防重
-  state.last_fired['nightly_memory_consolidation'] = todayStr;
-  saveState(state);
-
   consolidationRunning = true;
-  runNightlyConsolidation()
+  runNightlyConsolidation({ day, resume: st.day === day ? st : null })
     .catch((err) => {
       console.error('[睡眠记忆反思主流程异常]:', err.message);
       appendLog(`[睡眠记忆反思主流程异常]: ${err.message}`);
@@ -523,50 +542,60 @@ function splitIntoChunks(entries, maxChars) {
   return chunks;
 }
 
-function consolidationPrompt({ day, part, parts, chunk, userNickname, botName }) {
-  const sizes = new Map(listMemoryFiles(botRoot).map((f) => {
-    try { return [f.rel, charCount(fs.readFileSync(f.abs, 'utf-8'))]; } catch { return [f.rel, 0]; }
-  }));
-  const memoryPath = path.join(botRoot, 'MEMORY.md');
+// 整理提示词：workDir 是记忆的副本（智能体只改副本，程序核对后再合并回线上）
+function consolidationPrompt({ day, part, parts, chunk, userNickname, botName, workDir }) {
+  const size = (rel) => {
+    try { return charCount(fs.readFileSync(path.join(workDir, rel), 'utf-8')); } catch { return 0; }
+  };
+  const memoryPath = path.join(workDir, 'MEMORY.md');
   const currentMemory = fs.existsSync(memoryPath) ? capForLoading(fs.readFileSync(memoryPath, 'utf-8'), MEMORY_MAX_CHARS).text : '';
-  // 专题分卷的归档目标来自本实例的 topics.json，核心代码不写死任何专题
-  const topics = loadTopicsConfig(botRoot);
+  // 专题来自本实例的 topics.json，核心代码不写死任何专题
+  const topics = loadTopicsConfig(workDir);
   const topicLines = topics.length
-    ? topics.map((t) => `   - ${t.name}：更新至 data/memory/topics/${t.file}（现在 ${sizes.get(`data/memory/topics/${t.file}`) || 0} 字）；`).join('\n')
-    : '   - （本实例没有配置专题分卷，全部归入 MEMORY.md）';
+    ? topics.map((t) => `   - ${t.name}：data/memory/topics/${t.file}（现在 ${size(`data/memory/topics/${t.file}`)} 字）`).join('\n')
+    : '   - （还没有专题。需要时新建 data/memory/topics/<英文名>.md，并在 topics.json 里登记名字和关键词）';
+  const shelves = [...new Set(listMemoryFiles(workDir).filter((f) => f.kind === 'library').map((f) => f.rel.split('/')[3]))];
+  const md = day.slice(5);
   const partNote = parts > 1
-    ? `昨天聊得比较多，分成 ${parts} 段整理，这是第 ${part} 段；前面的段已经整理过，下面的 MEMORY.md 是整理后的最新内容。\n`
+    ? `昨天聊得比较多，分成 ${parts} 段整理，这是第 ${part} 段；前面的段已经整理过，当前目录里的记忆是整理后的最新内容。\n`
     : '';
 
-  return `你是一个顶级的 AI 知识管理与记忆沉淀分析师。
-你的唯一任务是：审阅用户【${userNickname}】昨日（${day}）与助手【${botName}】的微信聊天记录，结合当前 MEMORY.md 现状，去粗取精，提取出高价值的长期记忆，增量更新或沉淀到当前目录的 MEMORY.md 或 data/memory/topics/ 对应专题分卷中。
+  return `你是${botName}的记忆整理员。任务：读用户【${userNickname}】昨天（${day}）和助手【${botName}】的微信聊天记录，把值得长期记住的内容整理进当前目录下的记忆文件。
 ${partNote}
-【核心萃取原则】：
-1. 坚决过滤口水废话：忽略打招呼（“你好/在吗”）、客套答谢、一次性天气询问、普通的短视频下载解析等临时性指令。
-2. 重点萃取核心认知：
-   - 用户明确表达的新偏好、新习惯、新禁忌、作息时间变化；
-   - 重要的专项心得与经验（归入下面对应的专题分卷）；
-   - 跨多天的连续事件或长期待办约定。
-3. 知识归档原则：
-   - 核心全局偏好：合并到当前目录下的 MEMORY.md（现在 ${sizes.get('MEMORY.md') || 0} 字）；
+记忆分四块，都在当前目录下：
+1. 核心档案 MEMORY.md（现在 ${size('MEMORY.md')} 字，上限 ${MEMORY_MAX_CHARS} 字）：每次聊天都要用到的——用户的身份、称呼、偏好、作息、底线。
+2. 专题 data/memory/topics/（每本上限 ${TOPIC_MAX_CHARS} 字）：某个领域的结论、决定、现状，一条一两句话。现有专题：
 ${topicLines}
-4. 只改跟昨天聊天有关的条目：昨天没聊到的条目一个字都不要动，不要为了省字数去删字、换说法或合并别的条目（下面第 5 条的整条挪动除外）。被昨天的新信息取代的内容可以更新，仍然有效的信息不能删除。如果昨日没有值得长期记住的新内容，就保持原样，不要为了修改而修改。
-5. 长度：MEMORY.md 不超过 ${MEMORY_MAX_CHARS} 字，每个专题分卷不超过 ${TOPIC_MAX_CHARS} 字。MEMORY.md 放不下新内容时，把属于某个专题的一整条细节原样挪进对应的专题分卷（MEMORY.md 里留一句“详见某某分卷”）；没有合适的专题、或者专题分卷也满了，就照常写，超出一些没关系，不要为了控制字数删减已有内容。
+3. 资料库 data/memory/library/<专题文件名去掉 .md>/<主题>.md：调研资料、参数、价格、型号、步骤、对比、教程原文。一个文件一个主题，已有的接着往后写。${shelves.length ? `现有：${shelves.join('、')}。` : ''}
+4. 大事记 data/memory/timeline/${day.slice(0, 7)}.md：在文件末尾加一节「## ${md}」，3～8 行，一行一件事：昨天发生了什么、定了什么、完成了什么。不写闲聊。
+
+规则：
+1. 只记有长期价值的：新的偏好、习惯、禁忌、决定、结论、长期待办、重要经历。忽略打招呼、客套、一次性的查询（问天气、下载一个视频）。
+2. 只改和昨天聊天有关的条目：昨天没聊到的条目一个字都不要动（日期也不动），不要为了省字数去删字、合并或改写别的条目。
+3. 同一件事只留最新的：已经有这件事的条目，就改那一条，不要另加一条；被取代的旧说法值得留的，写进大事记（"某某从 A 改成 B"）。
+4. 资料细节放资料库：专题里只写一句结论，后面注明"（细节见资料库 <路径>）"。
+5. 专题和核心档案里，昨天聊到的条目末尾标〔${md}〕（已有日期的改成〔${md}〕）。用户说"一直记住"的条目开头加 📌。
+6. 用户说"忘掉""别记了"的：从核心档案和专题里删掉，大事记里只写一行"已按要求忘掉：<一个词说明是哪方面>"，不写具体内容。
+7. 只写事实、规则、数字，不用比喻和修辞。
+8. 文件超了上限也不要自己删别的内容：程序会另外把旧条目原样搬去资料库。
+9. 资料库和大事记只往里加，不改、不删已有内容。
+10. 只改当前目录下的这些记忆文件和 topics.json，别的文件不要动。昨天没有值得记的就什么都不改。
 
 【当前 MEMORY.md 全文】：
 ${currentMemory}
 
-【昨日真实对话记录${parts > 1 ? `（第 ${part}/${parts} 段）` : ''}】：
+【昨天的聊天记录${parts > 1 ? `（第 ${part}/${parts} 段）` : ''}】：
 ${chunk}`;
 }
 
-function runConsolidationAgent(promptText) {
+// 整理用的智能体在记忆副本的目录里跑（cwd），只改副本
+function runConsolidationAgent(promptText, cwd) {
   return new Promise((resolve) => {
     const args = ['--dangerously-skip-permissions', ...AGY_STREAM_ARGS];
     const child = execFile(
       'agy',
       args,
-      { cwd: botRoot, timeout: CONSOLIDATION_TIMEOUT_MS, env: process.env, maxBuffer: 10 * 1024 * 1024 },
+      { cwd, timeout: CONSOLIDATION_TIMEOUT_MS, env: process.env, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => resolve({ outcome: agyOutcome(err, stdout, stderr), err, stderr })
     );
     // 提示词（含昨天的聊天记录）从标准输入交过去，不放在命令行参数里
@@ -575,16 +604,16 @@ function runConsolidationAgent(promptText) {
   });
 }
 
-// 自动维护清理 30 天前的旧日志切片
+// 清理 LOG_KEEP_DAYS 天（默认一年）以前的按天日志
 function cleanOldDailyLogs() {
   const historyDir = path.join(dataDir, 'history');
   try {
     if (fs.existsSync(historyDir)) {
-      const thirtyDaysAgoMs = Date.now() - 30 * 86400000;
+      const cutoffMs = Date.now() - LOG_KEEP_DAYS * 86400000;
       for (const file of fs.readdirSync(historyDir)) {
         if (file.startsWith('chat_') && file.endsWith('.log')) {
           const fullP = path.join(historyDir, file);
-          if (fs.statSync(fullP).mtimeMs < thirtyDaysAgoMs) {
+          if (fs.statSync(fullP).mtimeMs < cutoffMs) {
             fs.unlinkSync(fullP);
             console.log(`[自动归档清理过时日志]: ${file}`);
           }
@@ -597,23 +626,94 @@ function cleanOldDailyLogs() {
 }
 
 /**
- * 整理昨天（北京时间）的全部聊天：没有昨天的按天日志就跳过（不再退回去读总日志，免得旧对话被一遍遍重新整理）；
- * 聊得多就按消息边界分段，一段一段整理，每段都重新读一遍当前记忆。进度写在 data/state/memory_consolidation.json，
- * 主人的机器人存记忆版本时据此标明"凌晨整理"。
+ * 整理一段聊天：先把记忆复制一份，智能体只改副本；改完核对（见 memory_slim.js 的 checkChanges），
+ * 通过了才合并回线上，没通过或出错就丢掉副本——线上不会留下改了一半的文件。
  */
-export async function runNightlyConsolidation({ day } = {}) {
-  saveRuntimeState('memory_consolidation', { running: true, started_at: Date.now(), finished_at: null, result: null, parts: 0 });
-  let result = 'skipped';
-  let parts = 0;
-  console.log(`\n🌙 [03:00 睡眠记忆固化反思启动]: 正在复盘昨日知识与习惯并沉淀至 MEMORY.md...`);
-  appendLog(`[03:00 睡眠记忆固化启动] 开始复盘沉淀昨日记忆`);
+async function consolidateChunk({ day, part, parts, chunk, userNickname, botName }) {
+  const work = prepareWorkCopy(botRoot);
+  try {
+    const promptText = consolidationPrompt({ day, part, parts, chunk, userNickname, botName, workDir: work.dir });
+    const { outcome, err, stderr } = await runConsolidationAgent(promptText, work.dir);
+    recordAgentResult('scheduler', outcome);
+    if (!outcome.ok) {
+      // 只记退出码和错误输出的末尾，不用 err.message（里面是完整命令行）
+      const detail = outcome.kind === 'auth'
+        ? outcome.reason
+        : outcome.kind === 'timeout'
+          ? `超过 ${durationText(CONSOLIDATION_TIMEOUT_MS)}没整理完，这一段的改动没有采用`
+          : String(stderr || '').trim().slice(-300) || `exit ${err?.code ?? err?.signal ?? 'status ERROR'}`;
+      return { ok: false, kind: outcome.kind, detail };
+    }
+    const check = checkChanges(work, collectChanges(work));
+    for (const n of check.notes) console.warn(`[睡眠记忆固化] ${n}`);
+    if (!check.ok) return { ok: false, kind: 'rejected', detail: `整理结果没通过核对，没有采用：${check.reason}` };
+    return { ok: true, ...applyChanges(botRoot, check.changes) };
+  } finally {
+    discardWorkCopy(work);
+  }
+}
+
+// 超上限的核心档案或专题，一晚腾一个：旧的、细节的条目原样搬去资料库（只搬不删，程序核对）
+async function slimOneOverLimitFile() {
+  const over = overLimitFiles(botRoot);
+  if (!over.length) return null;
+  const f = over[0];
+  const agent = agyPlanAgent(botRoot);
+  const runPlanAgent = async (prompt) => {
+    try {
+      const text = await agent(prompt);
+      recordAgentResult('scheduler', { ok: true });
+      return text;
+    } catch (e) {
+      if (e.outcome) recordAgentResult('scheduler', e.outcome);
+      throw e;
+    }
+  };
+  const res = await slimFile(botRoot, f.rel, { runPlanAgent, today: getBeijingInfo().dateStr });
+  if (res.ok) {
+    const n = res.moved.reduce((s, m) => s + m.count, 0);
+    console.log(`[腾地方] ${res.label}：${res.before} → ${res.after} 字，搬了 ${n} 条到 ${res.moved.map((m) => m.to).join('、')}`);
+    appendLog(`[腾地方] ${res.label} ${res.before} → ${res.after} 字，搬了 ${n} 条去资料库`);
+  } else {
+    console.warn(`[腾地方没完成] ${f.label}：${res.reason}`);
+    raiseAlert('memory_consolidation_failed', `「${f.label}」超上限，今晚腾地方没完成：${res.reason}。内容没有动，明晚再试`);
+  }
+  if (res.conflicts?.length) {
+    raiseAlert('memory_consolidation_failed', `腾地方时「${f.label}」正好也被改了，自动合并不了，这次没有改它；搬家结果另存在 ${res.conflicts.map((c) => c.saved).join('、')}`);
+  }
+  return res;
+}
+
+/**
+ * 整理昨天（北京时间）的全部聊天：没有昨天的按天日志就跳过（不再退回去读总日志，免得旧对话被一遍遍重新整理）；
+ * 聊得多就按消息边界分段，一段一段整理，每段都在副本上做、核对后合并回线上。
+ * 进度写在 data/state/memory_consolidation.json：哪一天、第几次尝试、整理完了几段、下次什么时候重试；
+ * 失败了从没整理完的那一段接着来。管理服务存记忆版本时也据此标明"凌晨整理"。
+ * 全部整理完以后，超上限的文件腾一个。
+ */
+export async function runNightlyConsolidation({ day, resume = null } = {}) {
+  const yesterdayStr = day || getBeijingInfo(new Date(Date.now() - 86400000)).dateStr;
+  const prev = resume && resume.day === yesterdayStr ? resume : {};
+  const attempts = (prev.attempts || 0) + 1;
+  let chunksDone = prev.chunks_done || 0;
+  let result = 'failed';
+  let parts = prev.parts || 0;
+  let nextTry = null;
+  let lastError = null;
+  saveRuntimeState('memory_consolidation', {
+    day: yesterdayStr, attempts, running: true, started_at: Date.now(), finished_at: null,
+    result: null, parts, chunks_done: chunksDone, next_try_at: null, last_error: null,
+  });
+  console.log(`\n🌙 [03:00 睡眠记忆固化反思启动]: 整理 ${yesterdayStr} 的聊天${attempts > 1 ? `（第 ${attempts} 次尝试，从第 ${chunksDone + 1} 段接着来）` : ''}...`);
+  appendLog(`[03:00 睡眠记忆固化启动] 开始复盘沉淀昨日记忆${attempts > 1 ? `（第 ${attempts} 次尝试）` : ''}`);
 
   try {
-    const yesterdayStr = day || getBeijingInfo(new Date(Date.now() - 86400000)).dateStr;
     const logPath = path.join(dataDir, 'history', `chat_${yesterdayStr}.log`);
     if (!fs.existsSync(logPath)) {
+      result = 'skipped';
       console.log(`[睡眠记忆固化跳过]: 昨天（${yesterdayStr}）没有聊天记录。`);
       appendLog(`[睡眠记忆固化跳过] 昨日没有聊天记录`);
+      await slimOneOverLimitFile();
       return;
     }
 
@@ -625,8 +725,10 @@ export async function runNightlyConsolidation({ day } = {}) {
     const total = entries.reduce((n, e) => n + charCount(e.text), 0);
     // 用户昨天没说过话，或者内容过短（小于 150 字），无需消耗 AI 额度
     if (!entries.some((e) => e.role === 'user') || total < 150) {
+      result = 'skipped';
       console.log(`[睡眠记忆固化跳过]: 昨日无足够对话记录 (${total} 字)。`);
       appendLog(`[睡眠记忆固化跳过] 昨日无足够对话记录`);
+      await slimOneOverLimitFile();
       return;
     }
 
@@ -636,36 +738,41 @@ export async function runNightlyConsolidation({ day } = {}) {
       appendLog(`[睡眠记忆固化] 昨日聊天有 ${chunks.length} 段，只整理了最后 ${MAX_CHUNKS} 段`);
       chunks = chunks.slice(-MAX_CHUNKS);
     }
+    parts = chunks.length;
 
-    for (let i = 0; i < chunks.length; i++) {
-      parts = i + 1;
+    for (let i = chunksDone; i < chunks.length; i++) {
       const where = chunks.length > 1 ? `（第 ${i + 1}/${chunks.length} 段）` : '';
-      const promptText = consolidationPrompt({ day: yesterdayStr, part: i + 1, parts: chunks.length, chunk: chunks[i], userNickname, botName });
-      const { outcome, err, stderr } = await runConsolidationAgent(promptText);
-      recordAgentResult('scheduler', outcome);
-      if (!outcome.ok) {
-        result = 'failed';
-        // 超时：写明限时、停下之前写进去的改动都留着、后面还有几段没整理；
-        // 其他错误只记退出码和错误输出的末尾，不用 err.message（里面是完整命令行）
-        const rest = chunks.length - i - 1;
-        const detail = outcome.kind === 'auth'
-          ? outcome.reason
-          : outcome.kind === 'timeout'
-            ? `超过 ${durationText(CONSOLIDATION_TIMEOUT_MS)}没整理完，已经停下${rest ? `，后面 ${rest} 段这次没整理` : ''}；停下之前写进去的改动都留着，早上的“记忆变动”里能看到`
-            : String(stderr || '').trim().slice(-300) || `exit ${err?.code ?? err?.signal ?? 'status ERROR'}`;
-        console.error(`[睡眠记忆固化执行异常]${where}: ${detail}`);
-        appendLog(`[睡眠记忆固化失败]${where}: ${detail}`);
+      const r = await consolidateChunk({ day: yesterdayStr, part: i + 1, parts: chunks.length, chunk: chunks[i], userNickname, botName });
+      if (!r.ok) {
+        lastError = r.detail;
+        const retry = attempts < MAX_ATTEMPTS;
+        if (retry) nextTry = Date.now() + RETRY_AFTER_MS;
+        console.error(`[睡眠记忆固化执行异常]${where}: ${r.detail}`);
+        appendLog(`[睡眠记忆固化失败]${where}: ${r.detail}`);
         // 登录失效由"智能体登录失效"告警统一报，这里不再重复报一条
-        if (outcome.kind !== 'auth') raiseAlert('memory_consolidation_failed', `凌晨记忆整理失败${where}：${detail}`);
+        if (r.kind !== 'auth') {
+          raiseAlert('memory_consolidation_failed', `凌晨记忆整理失败${where}：${r.detail}。${retry
+            ? `${Math.round(RETRY_AFTER_MS / 60000)} 分钟后自动重试（第 ${attempts + 1}/${MAX_ATTEMPTS} 次），已经整理好的段不会重复整理`
+            : '今天的自动重试已经用完，没整理的部分今天不会再整理'}`);
+        }
         return;
       }
-      if (where) console.log(`[睡眠记忆固化]: ${where.slice(1, -1)}整理完成`);
+      chunksDone = i + 1;
+      saveRuntimeState('memory_consolidation', { chunks_done: chunksDone, parts });
+      if (r.conflicts.length) {
+        raiseAlert('memory_consolidation_failed', `整理${where}时 ${r.conflicts.map((c) => c.rel).join('、')} 正好也被改了，自动合并不了，没有改它们；整理结果另存在 ${r.conflicts.map((c) => c.saved).join('、')}`);
+      }
+      if (where) console.log(`[睡眠记忆固化]: ${where.slice(1, -1)}整理完成，改了 ${r.applied.length} 个文件`);
     }
     result = 'ok';
-    console.log(`🎉 [03:00 睡眠记忆固化完成]: 昨日智慧已成功沉淀入知识库！${chunks.length > 1 ? `（分 ${chunks.length} 段）` : ''}`);
-    appendLog(`[睡眠记忆固化完成] 昨日智慧已成功沉淀入知识库`);
+    console.log(`🎉 [03:00 睡眠记忆固化完成]: 昨天的聊天整理完了${chunks.length > 1 ? `（分 ${chunks.length} 段）` : ''}`);
+    appendLog(`[睡眠记忆固化完成] 昨天的聊天整理完了`);
+    await slimOneOverLimitFile();
   } finally {
-    saveRuntimeState('memory_consolidation', { running: false, finished_at: Date.now(), result, parts });
+    if (result === 'failed' && !nextTry && attempts < MAX_ATTEMPTS) nextTry = Date.now() + RETRY_AFTER_MS;
+    saveRuntimeState('memory_consolidation', {
+      running: false, finished_at: Date.now(), result, parts, chunks_done: chunksDone, next_try_at: nextTry, last_error: lastError,
+    });
     cleanOldDailyLogs();
   }
 }
@@ -722,7 +829,7 @@ async function startScheduler() {
     const scope = t.workdaysOnly ? '周一至周五(工作日)' : '每天';
     console.log(` • [${time}] ${scope} - ${t.name}`);
   }
-  console.log(` • [03:00] 每天 - 类人脑睡眠记忆固化与反思 (自动沉淀至 MEMORY.md)`);
+  console.log(` • [03:00] 每天 - 把昨天的聊天整理进记忆（失败自动重试；超上限的文件把旧条目搬去资料库）`);
   const memoryNote = {
     owner: '记忆历史：定时检查所有实例的记忆改动并存版本，早间播报附上"记忆变动"',
     standalone: '记忆历史：定时检查本实例的记忆改动并存版本（data/memory-history/），早间播报附上"记忆变动"',
