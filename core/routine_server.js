@@ -40,7 +40,7 @@ import {
 import { memoryMode, useStandaloneHistory, parseMemoryCommand, findBotByName, showChanges, undoItems } from './memory_history.js';
 import { parseCredentialCommand, saveSkillCredential, credentialHelp, isInstalled } from './skills.js';
 import { raiseAlert } from './alert.js';
-import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
+import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, agyContextTokens, recordAgentResult } from './agent_health.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
@@ -290,7 +290,8 @@ function extractMediaPaths(text) {
 // 正在运行的 agy 进程数（含转入后台的任务），用来限制同时跑的智能体数量
 let activeAgents = 0;
 
-function runAgent(promptText, conversationId = null) {
+// freshPrompt：原会话接不上、改开新会话重试时用的提示词（带最近几条回复的全文）；不给就用原来的
+function runAgent(promptText, conversationId = null, freshPrompt = null) {
   return new Promise((resolve, reject) => {
     const args = ['--dangerously-skip-permissions'];
     if (conversationId) {
@@ -319,7 +320,7 @@ function runAgent(promptText, conversationId = null) {
           if (conversationId && outcome.kind === 'error') {
             console.warn(`[agy] 会话 ${conversationId} 恢复失败，自动创建全新会话重试...`);
             // 标记 resumeFailed，回复里会告诉用户"原来的会话没接上"
-            return runAgent(promptText, null)
+            return runAgent(freshPrompt || promptText, null)
               .then((res) => resolve({ ...res, resumeFailed: true }))
               .catch(reject);
           }
@@ -338,7 +339,7 @@ function runAgent(promptText, conversationId = null) {
         if (outcome.warning) console.warn(`[agy 提示] 有回复，但带着提示（照常使用回复）：${outcome.warning}`);
         const usage = outcome.json.usage;
         if (usage) console.log(`[agy 用量]: 输入 ${usage.input_tokens ?? '?'} tokens，输出 ${usage.output_tokens ?? '?'} tokens`);
-        resolve({ reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId });
+        resolve({ reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId, contextTokens: agyContextTokens(stdout) });
       }
     );
     // 提示词从标准输入交过去；agy 提前退出时写入会报 EPIPE，忽略即可（结果由上面的回调处理）
@@ -415,10 +416,17 @@ const MAX_ACTIVE_AGENTS = 2;
 const SOFT_TIMEOUT_MS = Number(process.env.ROUTINE_SOFT_TIMEOUT_MS) || 90000;
 // 等结果期间每隔多久重发一次"正在输入"，免得对方以为没反应（环境变量仅供测试）
 const TYPING_REFRESH_MS = Number(process.env.ROUTINE_TYPING_REFRESH_MS) || 20000;
-// 主会话每天换一次：北京时间 03:30（凌晨整理完记忆）以后的第一条消息开新会话；会话库太大时也提前换。
+// 主会话每天换一次：北京时间 03:30（凌晨整理完记忆）以后的第一条消息开新会话；会话库太大、或者上一次回复时会话已经超过
+// ROTATE_MAX_TOKENS 时也提前换。
 // 不写重置标记：最近几轮聊天和长期记忆照常带上，只是 agy 不再背着越来越长的历史（环境变量仅供测试）
 const ROTATE_AT_MINUTES = Number(process.env.ROUTINE_ROTATE_AT_MINUTES || 210);
 const ROTATE_MAX_BYTES = Number(process.env.ROUTINE_ROTATE_MAX_BYTES) || 20 * 1024 * 1024;
+// 主会话上一次回复时带的上下文（agy 报的输入 token）超过这个数，下一条消息就开新会话：
+// 一整天不换的话，晚上会涨到 25 万（模型上限），agy 自己压缩时会丢细节，每次调用也白白重发十几万 token
+const ROTATE_MAX_TOKENS = Number(process.env.ROUTINE_ROTATE_MAX_TOKENS) || 80000;
+// 开新会话时（换会话、后台占用期间的临时会话、原会话接不上），最近几条助手回复带全文、每条最多多少字；平时只带前 200 字
+const FULL_REPLIES_ON_NEW_SESSION = 2;
+const FULL_REPLY_MAX_CHARS = 2000;
 
 // 最近一次已经过去的北京时间 03:30（毫秒时间戳）
 function lastRotationBoundary(now = Date.now()) {
@@ -438,6 +446,8 @@ function conversationRotationReason(state, convId) {
     return null;
   }
   if (startedAt < lastRotationBoundary()) return '已经过了凌晨整理记忆的时间';
+  const tokens = Number(state.conversation_tokens) || 0;
+  if (tokens > ROTATE_MAX_TOKENS) return `会话已经有 ${(tokens / 10000).toFixed(1)} 万 token`;
   try {
     const db = path.join(process.env.HOME || '', '.gemini', 'antigravity-cli', 'conversations', `${convId}.db`);
     const size = fs.statSync(db).size;
@@ -450,6 +460,13 @@ function conversationRotationReason(state, convId) {
 let mainConversationBusy = false;
 // 每次"重置会话"加一；后台任务结束时只有代数没变才回写会话 ID，不会把重置覆盖掉
 let mainConversationGeneration = 0;
+// 主会话被后台任务占着的这一段时间（一个"占用期"），后面来的消息共用一个临时会话，聊得连贯；
+// 占用期结束（后台任务做完）或者用户重置会话就丢掉。上一条临时消息还在跑时，新消息另开一个，不同时写同一个会话
+let mainBusyEpoch = 0;
+let sideConversation = { epoch: -1, generation: -1, id: null, running: false };
+const resetSideConversation = (epoch = -1) => {
+  sideConversation = { epoch, generation: mainConversationGeneration, id: null, running: false };
+};
 
 const CONVERSATION_LOST_NOTICE = '（提示：原来的会话没能接上，已经开了一个新会话，之前聊过的细节可能记不全了。）';
 // 智能体登录失效时回给用户的话（监控会同时通知主人去重新登录）
@@ -623,7 +640,8 @@ function parseTurnsFromLog(filePath, maxTurns = 10) {
         text = text.replace(/^[^\n]*您交办的长任务已全部处理完成[^\n]*[\r\n]*/, '');
         const condensed = text.split('\n').map(l => l.trim()).filter(Boolean).join(' ').slice(0, 200);
         if (condensed) {
-          parsedTurns.unshift({ role: '助手', text: condensed + (text.length > 200 ? '...' : '') });
+          // full：回复原文，开新会话时最近几条带全文用
+          parsedTurns.unshift({ role: '助手', text: condensed + (text.length > 200 ? '...' : ''), full: text.trim() });
         }
         continue;
       }
@@ -635,9 +653,10 @@ function parseTurnsFromLog(filePath, maxTurns = 10) {
 }
 
 /**
- * 提取最近几轮真实对话上下文 (跨天无缝缝合滑窗防失忆护栏)；遇到"会话已重置"标记就不再往前读
+ * 提取最近几轮真实对话上下文 (跨天无缝缝合滑窗防失忆护栏)；遇到"会话已重置"标记就不再往前读。
+ * 助手的话平时只带前 200 字；fullReplies > 0 时（开新会话），最近这么多条助手回复带全文（每条最多 FULL_REPLY_MAX_CHARS 字）
  */
-function getRecentChatContext(maxRounds = 5) {
+function getRecentChatContext(maxRounds = 5, { fullReplies = 0 } = {}) {
   const neededTurns = maxRounds * 2;
   const todayFile = getDailyLogPath(0);
   const yesterdayFile = getDailyLogPath(-1);
@@ -660,7 +679,16 @@ function getRecentChatContext(maxRounds = 5) {
   }
 
   if (turns.length > 0) {
-    const formatted = turns.map(t => `- ${t.role}: ${t.text}`).join('\n');
+    const replyIdx = turns.map((t, i) => (t.full ? i : -1)).filter((i) => i >= 0);
+    const fullIdx = new Set(fullReplies > 0 ? replyIdx.slice(-fullReplies) : []);
+    const formatted = turns.map((t, i) => {
+      if (!fullIdx.has(i) || t.full === t.text) return `- ${t.role}: ${t.text}`;
+      const chars = [...t.full];
+      const body = chars.length > FULL_REPLY_MAX_CHARS
+        ? `${chars.slice(0, FULL_REPLY_MAX_CHARS).join('')}…（这条回复共 ${chars.length} 字，后面省略）`
+        : t.full;
+      return `- ${t.role}（回复全文）: ${body}`;
+    }).join('\n');
     return `\n\n【最近对话历史上下文 (跨天连续记忆)】：\n${formatted}\n`;
   }
   return '';
@@ -880,7 +908,9 @@ async function handleWechatTask(task) {
   const isResetCommand = /^\s*(\/reset|\/clear|\/new|新会话|重置会话|清除记忆)\s*$/i.test(message_text);
   if (isResetCommand) {
     mainConversationGeneration++;
-    saveRuntimeState('routine', { conversation_id: null });
+    // 后台占用期间的临时会话也一起丢掉：重置以后的消息不再接着它
+    resetSideConversation(mainConversationBusy ? mainBusyEpoch : -1);
+    saveRuntimeState('routine', { conversation_id: null, conversation_tokens: 0 });
     // 写进聊天日志：之后组装最近对话、凌晨整理记忆都只看这个标记之后的内容
     appendLog(RESET_MARKER);
     const resetNotice = '已开启全新对话：之前的聊天上下文已经清空。长期记忆档案仍然保留，如果要删掉某条长期记忆，直接告诉我就好。';
@@ -1011,34 +1041,63 @@ async function handleWechatTask(task) {
   const generation = mainConversationGeneration;
   const routineState = useMainConversation ? loadRuntimeState('routine') : {};
   let currentConvId = useMainConversation ? routineState.conversation_id || null : null;
+  // 后台占用期间：接着用这段时间的临时会话；上一条临时消息还在跑，就另开一个（不同时写同一个会话）
+  const sideEpoch = mainBusyEpoch;
+  const useSide = !useMainConversation && sideConversation.epoch === sideEpoch
+    && sideConversation.generation === generation && !sideConversation.running;
   if (!useMainConversation) {
-    console.log('[会话占用] 主会话正被后台任务使用，本条消息改用临时会话处理。');
+    if (useSide) {
+      currentConvId = sideConversation.id;
+      sideConversation.running = true;
+    }
+    console.log(currentConvId
+      ? '[会话占用] 主会话正被后台任务使用，本条消息接着用这段时间的临时会话。'
+      : '[会话占用] 主会话正被后台任务使用，本条消息开临时会话处理（这段时间后面的消息接着用它）。');
   }
-  const rotateReason = conversationRotationReason(routineState, currentConvId);
+  const rotateReason = useMainConversation ? conversationRotationReason(routineState, currentConvId) : null;
   if (rotateReason) {
     console.log(`[会话轮换] ${rotateReason}，这条消息开新会话（最近的聊天和长期记忆照常带上）。`);
     currentConvId = null;
   }
   const rememberConversation = (res) => {
-    if (!useMainConversation || !res.conversationId || res.conversationId === currentConvId) return;
+    if (!useMainConversation) return;
     if (generation !== mainConversationGeneration) {
-      console.log('[会话已重置] 任务期间用户重置了会话，不再回写这次的会话 ID。');
+      if (res.conversationId && res.conversationId !== currentConvId) console.log('[会话已重置] 任务期间用户重置了会话，不再回写这次的会话 ID。');
       return;
     }
-    saveRuntimeState('routine', { conversation_id: res.conversationId, conversation_started_at: Date.now() });
-    console.log(`[已持久化会话记忆 ID]: ${res.conversationId}`);
+    const patch = {};
+    if (res.conversationId && res.conversationId !== currentConvId) Object.assign(patch, { conversation_id: res.conversationId, conversation_started_at: Date.now() });
+    // 记下会话现在多大，下一条消息据此决定要不要换新会话
+    if (Number.isFinite(res.contextTokens)) patch.conversation_tokens = res.contextTokens;
+    if (!Object.keys(patch).length) return;
+    saveRuntimeState('routine', patch);
+    if (patch.conversation_id) console.log(`[已持久化会话记忆 ID]: ${res.conversationId}`);
   };
   const withConversationNotice = (res, text) => (res.resumeFailed ? `${text}\n\n${CONVERSATION_LOST_NOTICE}` : text);
   const memorySection = loadBotMemory(message_text);
-  const recentChatSection = getRecentChatContext(5);
-  const fullMessage = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住什么，按规则第 8 节记：每次聊天都用得上的写进 MEMORY.md（不超过 ${MEMORY_MAX_CHARS} 字），某个领域的结论写进 data/memory/topics/ 对应专题（每本不超过 ${TOPIC_MAX_CHARS} 字），资料原文放 data/memory/library/；同一件事改原来那一条，不要另加一条。]${memorySection}${recentChatSection}\n[微信用户 ${userNickname}]: ${message_text}`;
+  // 开新会话（或原会话接不上、改开新会话重试）时，最近几条助手回复带全文；接着用原会话时只带前 200 字（会话里本来就有全文）
+  const freshRecent = getRecentChatContext(5, { fullReplies: FULL_REPLIES_ON_NEW_SESSION });
+  const recentChatSection = currentConvId ? getRecentChatContext(5) : freshRecent;
+  const promptHead = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住什么，按规则第 8 节记：每次聊天都用得上的写进 MEMORY.md（不超过 ${MEMORY_MAX_CHARS} 字），某个领域的结论写进 data/memory/topics/ 对应专题（每本不超过 ${TOPIC_MAX_CHARS} 字），资料原文放 data/memory/library/；同一件事改原来那一条，不要另加一条。]${memorySection}`;
+  const promptTail = `\n[微信用户 ${userNickname}]: ${message_text}`;
+  const fullMessage = `${promptHead}${recentChatSection}${promptTail}`;
+  const freshMessage = `${promptHead}${freshRecent}${promptTail}`;
 
   // 标记活跃后台任务
   activeBackgroundTasks.add(taskKey);
   const startedAt = Date.now();
 
   // 启动智能体执行 (10分钟超时保护)
-  const agentPromise = runAgent(fullMessage, currentConvId);
+  const agentPromise = runAgent(fullMessage, currentConvId, freshMessage);
+  if (useSide) {
+    // 临时会话这一条跑完（成没成都算），记下会话 ID 给这段时间后面的消息接着用
+    const releaseSide = (res) => {
+      if (sideConversation.epoch !== sideEpoch || sideConversation.generation !== generation) return;
+      sideConversation.running = false;
+      if (res?.conversationId) sideConversation.id = res.conversationId;
+    };
+    agentPromise.then(releaseSide, () => releaseSide(null));
+  }
 
   // 软超时定时器：SOFT_TIMEOUT_MS 内没完成，就切入后台运行并先回一句"转入后台"
   let softTimer = null;
@@ -1103,6 +1162,9 @@ async function handleWechatTask(task) {
     console.log(`⏳ [任务处理中 (>${SOFT_TIMEOUT_MS / 1000}s)，转入后台异步托管]: ${taskLabel}`);
     if (useMainConversation) {
       mainConversationBusy = true;
+      // 新的占用期：这段时间后面的消息共用一个新的临时会话
+      mainBusyEpoch++;
+      resetSideConversation(mainBusyEpoch);
     }
     backgroundTasks.set(taskKey, startedAt);
 
@@ -1161,10 +1223,11 @@ async function handleWechatTask(task) {
         }
       })
       .finally(() => {
-        // 后台任务结束，释放主会话
+        // 后台任务结束，释放主会话；这段时间的临时会话不再用（聊过的内容在最近聊天里，回到主会话照样接得上）
         backgroundTasks.delete(taskKey);
         if (useMainConversation) {
           mainConversationBusy = false;
+          resetSideConversation(-1);
         }
       });
   }

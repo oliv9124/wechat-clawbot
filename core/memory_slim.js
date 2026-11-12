@@ -1,7 +1,8 @@
 /**
  * 记忆整理的公共部分（凌晨整理、一次性迁移都用它）：
  *
- * 1. 在副本上整理：prepareWorkCopy → 智能体只改副本 → collectChanges → checkChanges 核对 → applyChanges 合并回线上。
+ * 1. 在副本上整理：prepareWorkCopy → 智能体交一张改动清单（numberMemory 给条目编号、parseChangeList 解析）→ applyChangeList 照清单改副本
+ *    → collectChanges → checkChanges 核对 → applyChanges 合并回线上。一段聊天只调一次智能体，它不碰任何文件。
  *    整理失败就丢掉副本，线上不会留下改了一半的文件。整理期间线上文件又被白天的对话改过的，用 git merge-file 三方合并；
  *    合并不了就保留线上的，把整理结果另存到 data/state/consolidation-conflicts/ 并告警。
  * 2. 腾地方 slimFile：核心档案或某本专题超上限时，智能体只出一份"搬家清单"（哪些条目搬去资料库哪个文件），
@@ -247,6 +248,228 @@ export function applyChanges(botRoot, changes) {
   return { applied, conflicts };
 }
 
+// ---------- 凌晨整理：改动清单 ----------
+// 智能体不再自己改文件（一段聊天要和模型来回十几到几十次，模型一慢就超时、整段作废）：
+// 一段只调一次智能体，它交一张改动清单（JSON），程序照着改副本，再走上面的核对、合并。
+
+const ITEM_START = /^\s*(?:[-*+•]|\d+[.)、])\s+/;
+const asId = (x) => {
+  const m = String(x ?? '').match(/\d+/);
+  return m ? `#${m[0]}` : '';
+};
+
+/**
+ * 核心档案和各本专题按条目编号给智能体看：编号全局唯一（#1、#2…），标题、空行照原样。
+ * files：[{ rel, label, kind }]。返回 { parts: [{ file, listing, size }], index: Map(编号 → { rel, i }), segsByRel: Map(rel → 段) }
+ */
+export function numberMemory(dir, files) {
+  let n = 0;
+  const index = new Map();
+  const segsByRel = new Map();
+  const parts = [];
+  for (const f of files) {
+    const text = readOrNull(path.join(dir, f.rel)) ?? '';
+    const segs = splitBlocks(text);
+    segsByRel.set(f.rel, segs);
+    const lines = segs.map((s, i) => {
+      if (s.type === 'heading') return s.lines[0];
+      if (s.type === 'gap') return '';
+      const id = `#${++n}`;
+      index.set(id, { rel: f.rel, i });
+      return `[${id}] ${s.text}`;
+    });
+    parts.push({ file: f, listing: lines.join('\n').replace(/\n{3,}/g, '\n\n').trim(), size: charCount(text) });
+  }
+  return { parts, index, segsByRel };
+}
+
+/** 从智能体的回复里取出改动清单 { replace, insert, library, timeline, newTopics }；没有能用的 JSON 就报错 */
+export function parseChangeList(text) {
+  const s = String(text ?? '');
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('回复里没有 JSON');
+  let j;
+  try {
+    j = JSON.parse(s.slice(start, end + 1));
+  } catch (e) {
+    throw new Error(`JSON 解析不了：${e.message}`);
+  }
+  if (!j || typeof j !== 'object' || !['replace', 'insert', 'library', 'timeline', 'new_topics'].some((k) => Array.isArray(j[k]))) {
+    throw new Error('JSON 里没有 replace / insert / library / timeline');
+  }
+  const arr = (x) => (Array.isArray(x) ? x.filter((y) => y && typeof y === 'object') : []);
+  const str = (x) => (typeof x === 'string' ? x : '');
+  return {
+    replace: arr(j.replace).filter((x) => asId(x.id) && typeof x.text === 'string').map((x) => ({ id: asId(x.id), text: x.text })),
+    insert: arr(j.insert).filter((x) => str(x.text).trim()).map((x) => ({ after: String(x.after ?? '').trim(), text: x.text })),
+    library: arr(j.library).filter((x) => str(x.file).trim() && str(x.text).trim()).map((x) => ({ file: x.file.trim(), text: x.text })),
+    timeline: (Array.isArray(j.timeline) ? j.timeline : []).map((x) => str(x).replace(/\s*\n\s*/g, ' ').trim()).filter(Boolean),
+    newTopics: arr(j.new_topics).filter((x) => str(x.name).trim() && str(x.file).trim()).map((x) => ({
+      name: x.name.trim(),
+      file: x.file.trim(),
+      keywords: (Array.isArray(x.keywords) ? x.keywords : []).map((k) => String(k).trim()).filter(Boolean).slice(0, 20),
+      text: str(x.text),
+    })),
+  };
+}
+
+const textLines = (text) => {
+  const lines = String(text ?? '').replace(/\r/g, '').split('\n').map((l) => l.replace(/\s+$/, ''));
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines;
+};
+// 新加的条目：没有列表符号的行补上"- "（标题、表格、缩进的子项、空行、已有列表符号的照旧）
+const asItemLines = (text) => textLines(text).map((l) => (!l || /^\s/.test(l) || /^#{1,6}\s/.test(l) || l.startsWith('|') || ITEM_START.test(l) ? l : `- ${l}`));
+
+/**
+ * 照改动清单改副本（dir）。不合规的项跳过、记进 notes，其余照改：
+ *  - replace：编号要存在；带 📌 的条目不删，改写后也要留着 📌；text 为空表示删掉这一条（用户要求忘掉时用）；
+ *  - insert：加在某一条后面（after 写编号），或者加到某个文件末尾（after 写 MEMORY.md 或专题文件名）；
+ *  - library：只往资料库文件末尾追加，没有就新建，路径必须在资料库里；
+ *  - timeline：加在当月大事记「## 月-日」下面（同一天已经有这一节就接着写）；
+ *  - newTopics：建专题文件、登记到 topics.json；已经有的专题，内容加到它末尾。
+ * 返回 { notes, counts }
+ */
+export function applyChangeList(dir, list, { day, numbered }) {
+  const notes = [];
+  const counts = { replace: 0, delete: 0, insert: 0, library: 0, timeline: 0, newTopics: 0 };
+  const edits = new Map();
+  const editOf = (rel) => {
+    if (!edits.has(rel)) edits.set(rel, { replaced: new Map(), after: new Map(), tail: [] });
+    return edits.get(rel);
+  };
+  const relOfName = (name) => {
+    const s = String(name || '').trim().replace(/\\/g, '/').replace(/^[[【「"']+|[\]】」"']+$/g, '');
+    if (!s) return null;
+    if (/^(?:MEMORY(?:\.md)?|核心档案|核心)$/i.test(s)) return 'MEMORY.md';
+    const base = path.basename(s);
+    const file = base.endsWith('.md') ? base : `${base}.md`;
+    for (const rel of numbered.segsByRel.keys()) if (rel !== 'MEMORY.md' && path.basename(rel) === file) return rel;
+    const label = s.replace(/^专题[:：]?\s*/, '');
+    const hit = numbered.parts.find((p) => p.file.kind === 'topic' && p.file.label === label);
+    return hit ? hit.file.rel : null;
+  };
+
+  for (const r of list.replace) {
+    const at = numbered.index.get(r.id);
+    if (!at) { notes.push(`没有 ${r.id} 这一条，改不了`); continue; }
+    const seg = numbered.segsByRel.get(at.rel)[at.i];
+    const e = editOf(at.rel);
+    if (e.replaced.has(at.i)) { notes.push(`${r.id} 改了不止一次，只用第一次的`); continue; }
+    const lines = textLines(r.text);
+    if (!lines.length) {
+      if (seg.pinned) { notes.push(`${r.id} 是 📌 置顶的，不删`); continue; }
+      e.replaced.set(at.i, null);
+      counts.delete++;
+      continue;
+    }
+    if (seg.pinned && !lines.join('\n').includes('📌')) { notes.push(`${r.id} 是 📌 置顶的，改写后没有 📌，没有采用`); continue; }
+    // 原来是列表项，新写的第一行没有列表符号：补上，保持文件格式
+    if (ITEM_START.test(seg.lines[0]) && !ITEM_START.test(lines[0]) && !/^#{1,6}\s/.test(lines[0])) lines[0] = `- ${lines[0]}`;
+    e.replaced.set(at.i, lines);
+    counts.replace++;
+  }
+
+  for (const ins of list.insert) {
+    const lines = asItemLines(ins.text);
+    if (!lines.length) continue;
+    if (/^\[?#?\d+\]?$/.test(ins.after)) {
+      const at = numbered.index.get(asId(ins.after));
+      if (!at) { notes.push(`没有 ${asId(ins.after)} 这一条，"${oneLine(ins.text, 20)}"不知道加在哪`); continue; }
+      const e = editOf(at.rel);
+      if (!e.after.has(at.i)) e.after.set(at.i, []);
+      e.after.get(at.i).push(...lines);
+      counts.insert++;
+      continue;
+    }
+    const rel = relOfName(ins.after);
+    if (!rel) { notes.push(`不知道加到哪：「${oneLine(ins.after, 30)}」`); continue; }
+    editOf(rel).tail.push(...lines);
+    counts.insert++;
+  }
+
+  // 新专题：已经有的（按文件名或名字）就把内容加到它末尾；真正新建的最后再写
+  const created = [];
+  let cfg = null;
+  for (const t of list.newTopics) {
+    const file = `${path.basename(t.file.replace(/\\/g, '/')).replace(/\.md$/i, '')}.md`;
+    const existing = relOfName(file) || relOfName(t.name);
+    if (existing && existing !== 'MEMORY.md') {
+      const lines = asItemLines(t.text);
+      if (lines.length) { editOf(existing).tail.push(...lines); counts.insert++; }
+      notes.push(`专题「${t.name}」已经有了，内容加到了它末尾`);
+      continue;
+    }
+    if (!/^[A-Za-z0-9_-]+\.md$/.test(file)) { notes.push(`新专题的文件名「${oneLine(t.file, 30)}」不合规（只能用英文字母、数字、_ 和 -）`); continue; }
+    if (cfg === null) {
+      try {
+        cfg = JSON.parse(readOrNull(path.join(dir, 'topics.json')) ?? '{"topics":[]}');
+        if (!Array.isArray(cfg.topics)) cfg.topics = [];
+      } catch {
+        notes.push('topics.json 读不出来，没有新建专题');
+        cfg = false;
+      }
+    }
+    if (!cfg) continue;
+    const rel = `${TOPICS_DIR}/${file}`;
+    if (cfg.topics.some((x) => x?.file === file || x?.name === t.name) || readOrNull(path.join(dir, rel)) !== null) {
+      notes.push(`专题「${t.name}」（${file}）已经登记过，没有重复新建`);
+      continue;
+    }
+    cfg.topics.push({ name: t.name, file, keywords: t.keywords.length ? t.keywords : [t.name] });
+    created.push({ rel, text: `# ${t.name}\n${asItemLines(t.text).length ? `\n${asItemLines(t.text).join('\n')}\n` : ''}` });
+    counts.newTopics++;
+  }
+
+  // 核心档案和专题：按段重新拼，没改的行原样保留
+  for (const [rel, e] of edits) {
+    const out = [];
+    numbered.segsByRel.get(rel).forEach((s, i) => {
+      if (s.type === 'item' && e.replaced.has(i)) {
+        const r = e.replaced.get(i);
+        if (r) out.push(...r);
+      } else {
+        out.push(...s.lines);
+      }
+      if (e.after.has(i)) out.push(...e.after.get(i));
+    });
+    while (out.length && !out[out.length - 1].trim()) out.pop();
+    out.push(...e.tail);
+    writeFileSafe(dir, rel, `${out.join('\n')}\n`);
+  }
+
+  for (const lib of list.library) {
+    let t = lib.file.replace(/\\/g, '/').replace(/^\/+/, '').replace(/^(?:data\/memory\/library|资料库)\/+/, '');
+    if (t && !t.endsWith('.md')) t = `${t}.md`;
+    const rel = `${LIBRARY_DIR}/${t}`;
+    if (!t || !allowedRel(rel)) { notes.push(`资料库路径「${oneLine(lib.file, 40)}」不合规`); continue; }
+    const old = readOrNull(path.join(dir, rel));
+    const body = textLines(lib.text).join('\n');
+    const next = old === null
+      ? `${body.startsWith('#') ? '' : `# ${path.basename(rel, '.md')}\n\n`}${body}\n`
+      : `${old.replace(/\s+$/, '')}\n\n${body}\n`;
+    writeFileSafe(dir, rel, next);
+    counts.library++;
+  }
+
+  if (list.timeline.length) {
+    const rel = `${TIMELINE_DIR}/${day.slice(0, 7)}.md`;
+    const md = day.slice(5);
+    let text = (readOrNull(path.join(dir, rel)) ?? `# ${day.slice(0, 7)} 大事记\n`).replace(/\s+$/, '');
+    const heads = text.match(/^## .*$/gm) || [];
+    if (heads[heads.length - 1]?.trim() !== `## ${md}`) text += `\n\n## ${md}`;
+    text += `\n${list.timeline.map((l) => (ITEM_START.test(l) ? l : `- ${l}`)).join('\n')}\n`;
+    writeFileSafe(dir, rel, text);
+    counts.timeline += list.timeline.length;
+  }
+
+  for (const c of created) writeFileSafe(dir, c.rel, c.text);
+  if (created.length) writeFileSafe(dir, 'topics.json', `${JSON.stringify(cfg, null, 2)}\n`);
+  return { notes, counts };
+}
+
 // ---------- 腾地方 ----------
 /**
  * 把记忆文件拆成段：标题（# 开头）、空行、条目（列表项连同下面缩进的子项和续行；普通段落、表格也各算一条）。
@@ -447,7 +670,7 @@ export function verifySlim(oldText, newText, destTexts) {
 }
 
 /** 用 agy 出搬家清单：在一个空目录里跑，只要它的文字回复 */
-export function agyPlanAgent(botRoot, { timeoutMs = Number(process.env.CLAWBOT_SLIM_TIMEOUT_MS) || 600_000 } = {}) {
+export function agyPlanAgent(botRoot, { timeoutMs = Number(process.env.CLAWBOT_SLIM_TIMEOUT_MS) || 1_200_000 } = {}) {
   return (prompt) => new Promise((resolve, reject) => {
     const cwd = path.join(botRoot, 'data', 'state', 'slim-agent');
     fs.rmSync(cwd, { recursive: true, force: true });

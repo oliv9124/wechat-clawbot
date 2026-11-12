@@ -74,6 +74,18 @@ export function agyResultText(stdout) {
   return '';
 }
 
+// 这次调用里最后一次请求模型时带了多少上下文（未缓存的输入 + 命中缓存的输入），就是会话现在有多大；取不到返回 null
+export function agyContextTokens(stdout) {
+  const lines = String(stdout || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let ev;
+    try { ev = JSON.parse(lines[i]); } catch { continue; }
+    const u = ev?.event === 'step_update' ? ev.step_update?.usage : null;
+    if (u && Number.isFinite(u.input_tokens)) return u.input_tokens + (Number(u.cache_read_tokens) || 0);
+  }
+  return null;
+}
+
 // stream-json 调用的结果：判断方式和 agentOutcome 一样；另外正常退出却没有 result 事件也算失败（不能把事件流当回复发出去）
 export function agyOutcome(error, stdout, stderr) {
   const outcome = agentOutcome(error, agyResultText(stdout), stderr);

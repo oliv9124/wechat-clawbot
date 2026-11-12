@@ -4,7 +4,10 @@ import { execFile } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { sendWechatReply, loadConfig, loadRuntimeState, saveRuntimeState, describeText, writeJsonAtomic } from './wechat_reply.js';
 import { loadTopicsConfig, textAfterLastReset, listMemoryFiles, capForLoading, charCount, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS } from './memory_config.js';
-import { prepareWorkCopy, discardWorkCopy, collectChanges, checkChanges, applyChanges, slimFile, overLimitFiles, agyPlanAgent } from './memory_slim.js';
+import {
+  prepareWorkCopy, discardWorkCopy, collectChanges, checkChanges, applyChanges, slimFile, overLimitFiles, agyPlanAgent,
+  numberMemory, parseChangeList, applyChangeList,
+} from './memory_slim.js';
 import { memoryMode, useStandaloneHistory, snapshotAll, buildDigest, markDigestDelivered, syncBotDigests } from './memory_history.js';
 import { raiseAlert } from './alert.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
@@ -451,7 +454,8 @@ const NIGHTLY_AT_MINUTE = (() => {
 })();
 const CHUNK_CHARS = Number(process.env.CLAWBOT_CONSOLIDATION_CHUNK_CHARS) || 12000;
 const MAX_CHUNKS = 8;
-const CONSOLIDATION_TIMEOUT_MS = Number(process.env.CLAWBOT_CONSOLIDATION_TIMEOUT_MS) || 600000; // 平时每段 2~4 分钟，最慢的一次 4 分半
+// 每段限时：一段只调一次智能体，平时一两分钟；模型慢的时候一次也可能要好几分钟，留足余量
+const CONSOLIDATION_TIMEOUT_MS = Number(process.env.CLAWBOT_CONSOLIDATION_TIMEOUT_MS) || 1200000;
 const durationText = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.round(ms / 1000)} 秒`);
 // 03:00 之后这么久之内都可以开始或补跑（失败了隔 15 分钟重试，一天最多试 3 次）；进度记在 data/state/memory_consolidation.json
 const NIGHT_WINDOW_MIN = Number(process.env.CLAWBOT_NIGHT_WINDOW_MIN) || 180;
@@ -542,61 +546,92 @@ function splitIntoChunks(entries, maxChars) {
   return chunks;
 }
 
-// 整理提示词：workDir 是记忆的副本（智能体只改副本，程序核对后再合并回线上）
-function consolidationPrompt({ day, part, parts, chunk, userNickname, botName, workDir }) {
-  const size = (rel) => {
-    try { return charCount(fs.readFileSync(path.join(workDir, rel), 'utf-8')); } catch { return 0; }
-  };
-  const memoryPath = path.join(workDir, 'MEMORY.md');
-  const currentMemory = fs.existsSync(memoryPath) ? capForLoading(fs.readFileSync(memoryPath, 'utf-8'), MEMORY_MAX_CHARS).text : '';
-  // 专题来自本实例的 topics.json，核心代码不写死任何专题
-  const topics = loadTopicsConfig(workDir);
-  const topicLines = topics.length
-    ? topics.map((t) => `   - ${t.name}：data/memory/topics/${t.file}（现在 ${size(`data/memory/topics/${t.file}`)} 字）`).join('\n')
-    : '   - （还没有专题。需要时新建 data/memory/topics/<英文名>.md，并在 topics.json 里登记名字和关键词）';
-  const shelves = [...new Set(listMemoryFiles(workDir).filter((f) => f.kind === 'library').map((f) => f.rel.split('/')[3]))];
+// 整理提示词：智能体不碰文件，只交一张改动清单（JSON），程序照着改副本、核对后合并回线上。
+// 核心档案和各本专题按条目编号给全（numberMemory），资料库只列文件名，聊天记录给这一段。
+// 11-12 凌晨两个机器人都超时：原来让智能体自己一步步改文件，一段要和模型来回十几到几十次，模型一慢就整段作废
+function consolidationPrompt({ day, part, parts, chunk, userNickname, botName, workDir, numbered }) {
+  const library = listMemoryFiles(workDir).filter((f) => f.kind === 'library').map((f) => f.rel.slice('data/memory/library/'.length));
   const md = day.slice(5);
+  const timeline = `data/memory/timeline/${day.slice(0, 7)}.md`;
+  const core = numbered.parts.find((p) => p.file.kind === 'core');
+  const topicParts = numbered.parts.filter((p) => p.file.kind === 'topic');
+  const topicLines = topicParts.length
+    ? topicParts.map((p) => `   - ${p.file.label}：${path.basename(p.file.rel)}（现在 ${p.size} 字）`).join('\n')
+    : '   - （还没有专题）';
+  const exampleTopic = topicParts.length ? path.basename(topicParts[0].file.rel) : 'health.md';
   const partNote = parts > 1
-    ? `昨天聊得比较多，分成 ${parts} 段整理，这是第 ${part} 段；前面的段已经整理过，当前目录里的记忆是整理后的最新内容。\n`
+    ? `昨天聊得比较多，分成 ${parts} 段整理，这是第 ${part} 段；前面的段已经整理过，下面给的记忆是整理后的最新内容。\n`
     : '';
+  // 文件写坏了、超过上限很多的：只列前面两倍上限的字数（后面的条目这次不改），免得提示词撑爆
+  const clip = (s, max) => {
+    const c = [...s];
+    return c.length > max * 2 ? `${c.slice(0, max * 2).join('')}\n…（后面还有 ${c.length - max * 2} 字没列出来，这次不改它们）` : s;
+  };
+  const sections = [
+    `【核心档案 MEMORY.md（现在 ${core?.size ?? 0} 字，上限 ${MEMORY_MAX_CHARS} 字）】：\n${clip(core?.listing || '（还是空的）', MEMORY_MAX_CHARS)}`,
+    ...topicParts.map((p) => `【专题：${p.file.label}（${path.basename(p.file.rel)}，现在 ${p.size} 字，上限 ${TOPIC_MAX_CHARS} 字）】：\n${clip(p.listing || '（还是空的）', TOPIC_MAX_CHARS)}`),
+  ];
 
-  return `你是${botName}的记忆整理员。任务：读用户【${userNickname}】昨天（${day}）和助手【${botName}】的微信聊天记录，把值得长期记住的内容整理进当前目录下的记忆文件。
+  return `你是${botName}的记忆整理员。任务：读用户【${userNickname}】昨天（${day}）和助手【${botName}】的微信聊天记录，把值得长期记住的内容整理进记忆。
 ${partNote}
-记忆分四块，都在当前目录下：
-1. 核心档案 MEMORY.md（现在 ${size('MEMORY.md')} 字，上限 ${MEMORY_MAX_CHARS} 字）：每次聊天都要用到的——用户的身份、称呼、偏好、作息、底线。
+你不能自己改文件，也不用改：只要交一张"改动清单"（JSON），程序照着改，改完再核对。要用的东西下面都给全了：核心档案和每本专题的全文（每一条前面的 [#编号] 用来指明改哪一条）、资料库有哪些文件、昨天的聊天记录。不要调用任何工具，不要读文件、列目录，也不要上网查——这是整理，不是调研，聊天里怎么说就怎么记。直接输出 JSON。
+
+记忆分四块：
+1. 核心档案 MEMORY.md（现在 ${core?.size ?? 0} 字，上限 ${MEMORY_MAX_CHARS} 字）：每次聊天都要用到的——用户的身份、称呼、偏好、作息、底线。
 2. 专题 data/memory/topics/（每本上限 ${TOPIC_MAX_CHARS} 字）：某个领域的结论、决定、现状，一条一两句话。现有专题：
 ${topicLines}
-3. 资料库 data/memory/library/<专题文件名去掉 .md>/<主题>.md：调研资料、参数、价格、型号、步骤、对比、教程原文。一个文件一个主题，已有的接着往后写。${shelves.length ? `现有：${shelves.join('、')}。` : ''}
-4. 大事记 data/memory/timeline/${day.slice(0, 7)}.md：在文件末尾加一节「## ${md}」，3～8 行，一行一件事：昨天发生了什么、定了什么、完成了什么。不写闲聊。
+3. 资料库 data/memory/library/<专题文件名去掉 .md>/<主题>.md：调研资料、参数、价格、型号、步骤、对比、教程，一个文件一个主题。每次往一个文件里加的内容只记要点，不超过 1500 字，不用整段照抄聊天（聊天原文另有一年的日志可查）。现有文件：${library.length ? library.slice(0, 80).join('、') : '（还没有）'}
+4. 大事记 ${timeline}：昨天发生了什么、定了什么、完成了什么，3～8 行，一行一件事，不写闲聊。程序会把它们放在「## ${md}」下面。
 
 规则：
 1. 只记有长期价值的：新的偏好、习惯、禁忌、决定、结论、长期待办、重要经历。忽略打招呼、客套、一次性的查询（问天气、下载一个视频）。
-2. 只改和昨天聊天有关的条目：昨天没聊到的条目一个字都不要动（日期也不动），不要为了省字数去删字、合并或改写别的条目。
-3. 同一件事只留最新的：已经有这件事的条目，就改那一条，不要另加一条；被取代的旧说法值得留的，写进大事记（"某某从 A 改成 B"）。
+2. 只改和昨天聊天有关的条目：昨天没聊到的条目一个字都不要动（不要写进清单，日期也不动），不要为了省字数去删字、合并或改写别的条目。
+3. 同一件事只留最新的：已经有这件事的条目，就用 replace 改那一条，不要另加一条；被取代的旧说法值得留的，写进大事记（"某某从 A 改成 B"）。
 4. 资料细节放资料库：专题里只写一句结论，后面注明"（细节见资料库 <路径>）"。
-5. 专题和核心档案里，昨天聊到的条目末尾标〔${md}〕（已有日期的改成〔${md}〕）。用户说"一直记住"的条目开头加 📌。
-6. 用户说"忘掉""别记了"的：从核心档案和专题里删掉，大事记里只写一行"已按要求忘掉：<一个词说明是哪方面>"，不写具体内容。
+5. 专题和核心档案里，昨天聊到的条目末尾标〔${md}〕（已有日期的改成〔${md}〕）。用户说"一直记住"的条目开头加 📌；带 📌 的条目改写时 📌 要保留。
+6. 用户说"忘掉""别记了"的：用 replace 把那一条的 text 写成空字符串（就是删掉），大事记里只写一行"已按要求忘掉：<一个词说明是哪方面>"，不写具体内容。
 7. 只写事实、规则、数字，不用比喻和修辞。
 8. 文件超了上限也不要自己删别的内容：程序会另外把旧条目原样搬去资料库。
-9. 资料库和大事记只往里加，不改、不删已有内容。
-10. 只改当前目录下的这些记忆文件和 topics.json，别的文件不要动。昨天没有值得记的就什么都不改。
+9. 资料库和大事记只往里加：程序会加在文件末尾，已有的内容不用重复。
+10. 昨天没有值得记的，就交一张空清单：{"replace":[],"insert":[],"library":[],"timeline":[]}。
 
-【当前 MEMORY.md 全文】：
-${currentMemory}
+改动清单的格式（只输出这一个 JSON，不要任何别的文字）：
+{"replace":[{"id":"#12","text":"改后的完整条目"}],
+ "insert":[{"after":"#12","text":"- 新条目〔${md}〕"}],
+ "library":[{"file":"<专题文件名去掉 .md>/<主题>.md","text":"要追加的内容"}],
+ "timeline":["一行一件事"],
+ "new_topics":[]}
+- replace：改已有的条目。id 是那一条前面的编号，text 是改后的完整条目（原来几行就写几行）。
+- insert：加新条目。after 写放在哪一条后面（放在相关小标题下最后一条的编号后面）；要加到某个文件末尾，after 写文件名（MEMORY.md 或专题的文件名，比如 ${exampleTopic}）。
+- library：file 写资料库里的相对路径；已有的文件追加到末尾，没有就新建。
+- timeline：只写这几行内容，每行一件事。
+- new_topics：现有专题都不合适、又确实需要时才新建（很少用），格式 {"name":"专题名","file":"英文名.md","keywords":["关键词"],"text":"第一批条目"}。
+- 没有要改的项就写空数组。
+
+${sections.join('\n\n')}
 
 【昨天的聊天记录${parts > 1 ? `（第 ${part}/${parts} 段）` : ''}】：
 ${chunk}`;
 }
 
-// 整理用的智能体在记忆副本的目录里跑（cwd），只改副本
-function runConsolidationAgent(promptText, cwd) {
+// 整理用的智能体在一个空目录里跑，只要它的文字回复（改动清单），它碰不到记忆文件
+const CONSOLIDATION_AGENT_DIR = path.join('data', 'state', 'consolidation-agent');
+// 整理用哪个模型：默认跟这个账号的设置走；环境变量可以单独指定（比如 gemini-3.8-flash-medium）
+const CONSOLIDATION_MODEL = process.env.CLAWBOT_CONSOLIDATION_MODEL || '';
+function runConsolidationAgent(promptText) {
   return new Promise((resolve) => {
-    const args = ['--dangerously-skip-permissions', ...AGY_STREAM_ARGS];
+    const cwd = path.join(botRoot, CONSOLIDATION_AGENT_DIR);
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    const args = ['--dangerously-skip-permissions', ...(CONSOLIDATION_MODEL ? ['--model', CONSOLIDATION_MODEL] : []), ...AGY_STREAM_ARGS];
     const child = execFile(
       'agy',
       args,
       { cwd, timeout: CONSOLIDATION_TIMEOUT_MS, env: process.env, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout, stderr) => resolve({ outcome: agyOutcome(err, stdout, stderr), err, stderr })
+      (err, stdout, stderr) => {
+        fs.rmSync(cwd, { recursive: true, force: true });
+        resolve({ outcome: agyOutcome(err, stdout, stderr), err, stderr });
+      }
     );
     // 提示词（含昨天的聊天记录）从标准输入交过去，不放在命令行参数里
     child.stdin.on('error', () => {});
@@ -626,14 +661,16 @@ function cleanOldDailyLogs() {
 }
 
 /**
- * 整理一段聊天：先把记忆复制一份，智能体只改副本；改完核对（见 memory_slim.js 的 checkChanges），
- * 通过了才合并回线上，没通过或出错就丢掉副本——线上不会留下改了一半的文件。
+ * 整理一段聊天：先把记忆复制一份；智能体只交改动清单，程序照清单改副本（不合规的项跳过并记下来）；
+ * 改完核对（见 memory_slim.js 的 checkChanges），通过了才合并回线上，没通过或出错就丢掉副本——线上不会留下改了一半的文件。
  */
 async function consolidateChunk({ day, part, parts, chunk, userNickname, botName }) {
   const work = prepareWorkCopy(botRoot);
   try {
-    const promptText = consolidationPrompt({ day, part, parts, chunk, userNickname, botName, workDir: work.dir });
-    const { outcome, err, stderr } = await runConsolidationAgent(promptText, work.dir);
+    const files = listMemoryFiles(work.dir).filter((f) => f.kind === 'core' || f.kind === 'topic');
+    const numbered = numberMemory(work.dir, files);
+    const promptText = consolidationPrompt({ day, part, parts, chunk, userNickname, botName, workDir: work.dir, numbered });
+    const { outcome, err, stderr } = await runConsolidationAgent(promptText);
     recordAgentResult('scheduler', outcome);
     if (!outcome.ok) {
       // 只记退出码和错误输出的末尾，不用 err.message（里面是完整命令行）
@@ -644,10 +681,18 @@ async function consolidateChunk({ day, part, parts, chunk, userNickname, botName
           : String(stderr || '').trim().slice(-300) || `exit ${err?.code ?? err?.signal ?? 'status ERROR'}`;
       return { ok: false, kind: outcome.kind, detail };
     }
+    let list;
+    try {
+      list = parseChangeList(outcome.json?.response);
+    } catch (e) {
+      return { ok: false, kind: 'error', detail: `智能体没交出能用的改动清单（${e.message}），这一段没有整理` };
+    }
+    const { notes, counts } = applyChangeList(work.dir, list, { day, numbered });
+    for (const n of notes) console.warn(`[睡眠记忆固化] 清单里这一项没有采用：${n}`);
     const check = checkChanges(work, collectChanges(work));
     for (const n of check.notes) console.warn(`[睡眠记忆固化] ${n}`);
     if (!check.ok) return { ok: false, kind: 'rejected', detail: `整理结果没通过核对，没有采用：${check.reason}` };
-    return { ok: true, ...applyChanges(botRoot, check.changes) };
+    return { ok: true, counts, skipped: notes, ...applyChanges(botRoot, check.changes) };
   } finally {
     discardWorkCopy(work);
   }
@@ -762,7 +807,8 @@ export async function runNightlyConsolidation({ day, resume = null } = {}) {
       if (r.conflicts.length) {
         raiseAlert('memory_consolidation_failed', `整理${where}时 ${r.conflicts.map((c) => c.rel).join('、')} 正好也被改了，自动合并不了，没有改它们；整理结果另存在 ${r.conflicts.map((c) => c.saved).join('、')}`);
       }
-      if (where) console.log(`[睡眠记忆固化]: ${where.slice(1, -1)}整理完成，改了 ${r.applied.length} 个文件`);
+      const n = r.counts || {};
+      console.log(`[睡眠记忆固化]: ${where ? where.slice(1, -1) : ''}整理完成：改 ${n.replace || 0} 条、删 ${n.delete || 0} 条、新加 ${n.insert || 0} 条、资料库 ${n.library || 0} 处、大事记 ${n.timeline || 0} 行${n.newTopics ? `、新专题 ${n.newTopics} 本` : ''}${r.skipped?.length ? `，跳过 ${r.skipped.length} 项` : ''}，写了 ${r.applied.length} 个文件`);
     }
     result = 'ok';
     console.log(`🎉 [03:00 睡眠记忆固化完成]: 昨天的聊天整理完了${chunks.length > 1 ? `（分 ${chunks.length} 段）` : ''}`);
