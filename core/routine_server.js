@@ -289,6 +289,12 @@ function extractMediaPaths(text) {
  */
 // 正在运行的 agy 进程数（含转入后台的任务），用来限制同时跑的智能体数量
 let activeAgents = 0;
+// 一次智能体运行最长多久，到点停掉（超过 90 秒的早已转进后台，所以这其实是后台任务的上限）。
+// 原来 10 分钟：11-13 一个改网页的大任务做到一半被停掉；改成 60 分钟（环境变量仅供测试）
+const AGENT_TIMEOUT_MS = Number(process.env.ROUTINE_AGENT_TIMEOUT_MS) || 60 * 60_000;
+const durationLabel = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.round(ms / 1000)} 秒`);
+// 到时间上限被停掉：如实说，不说成"中断了、换个问法"
+const timeoutNotice = (userNickname) => `${userNickname}，这个任务做了 ${durationLabel(AGENT_TIMEOUT_MS)}还没做完，按时间上限停掉了。停之前可能已经改了一部分文件、做了一部分事；要接着做，跟我说"接着做完"就行，也可以把任务拆小一点再发。`;
 
 // freshPrompt：原会话接不上、改开新会话重试时用的提示词（带最近几条回复的全文）；不给就用原来的
 function runAgent(promptText, conversationId = null, freshPrompt = null) {
@@ -307,7 +313,7 @@ function runAgent(promptText, conversationId = null, freshPrompt = null) {
       args,
       {
         cwd: botRoot,
-        timeout: 600000,
+        timeout: AGENT_TIMEOUT_MS,
         env: process.env,
         maxBuffer: 20 * 1024 * 1024,
       },
@@ -1087,7 +1093,7 @@ async function handleWechatTask(task) {
   activeBackgroundTasks.add(taskKey);
   const startedAt = Date.now();
 
-  // 启动智能体执行 (10分钟超时保护)
+  // 启动智能体执行（最长 AGENT_TIMEOUT_MS，默认 60 分钟）
   const agentPromise = runAgent(fullMessage, currentConvId, freshMessage);
   if (useSide) {
     // 临时会话这一条跑完（成没成都算），记下会话 ID 给这段时间后面的消息接着用
@@ -1132,10 +1138,12 @@ async function handleWechatTask(task) {
     let rawReply = '';
     if (raceResult.err) {
       console.error('[runAgent 异常]:', raceResult.err.message);
-      // 登录失效时如实说明（监控已经通知主人）；其他错误使用友好转译器脱敏
+      // 登录失效、到时间上限被停掉时如实说明（监控已经通知主人）；其他错误使用友好转译器脱敏
       plainReply = raceResult.err.agentFailure === 'auth'
         ? agentLoginNotice(botName)
-        : formatFriendlyError(raceResult.err, botName, userNickname);
+        : raceResult.err.agentFailure === 'timeout'
+          ? timeoutNotice(userNickname)
+          : formatFriendlyError(raceResult.err, botName, userNickname);
     } else {
       rawReply = raceResult.res.reply;
       plainReply = rawReply;
@@ -1214,7 +1222,9 @@ async function handleWechatTask(task) {
 
           const errorNotice = execErr.agentFailure === 'auth'
             ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`
-            : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`;
+            : execErr.agentFailure === 'timeout'
+              ? `🔔 【后台任务执行提醒】\n${timeoutNotice(userNickname)}`
+              : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`;
           await deliverResultToWechat(toUser, targetToken, errorNotice, '', true, message_text);
         } catch (postErr) {
           console.error(`[后台异常通知发送失败]:`, postErr.message);
@@ -1250,8 +1260,19 @@ function rememberHandled(messageId) {
   saveRuntimeState('routine', { recent_handled_ids: [...handled, messageId].slice(-500) });
 }
 
+// 智能体都在忙时，"咋样了"这类问进度的消息也先处理：它不调用智能体、马上回进度，不用排在长任务后面
+function isQuickStatusMessage(fileName) {
+  if (!(backgroundTasks.size > 0 || pushRateLimiter.isCoolingDown() > 0)) return false;
+  try {
+    const task = JSON.parse(fs.readFileSync(path.join(dataDir, 'inbox', 'pending', fileName), 'utf-8'));
+    return STATUS_QUESTION.test(String(task.message_text || '').trim());
+  } catch {
+    return false;
+  }
+}
+
 /**
- * 按时间顺序从收件箱取消息处理。同时运行的智能体达到上限时先不取，等有空位再继续。
+ * 按时间顺序从收件箱取消息处理。同时运行的智能体达到上限时先不取（问进度的除外），等有空位再继续。
  * 处理完（含后台任务结束）才记为已处理并删除文件；中途崩溃的消息会在下次启动时重新处理。
  */
 async function pumpInbox() {
@@ -1259,8 +1280,9 @@ async function pumpInbox() {
   pumping = true;
   const skipped = new Set();
   try {
-    while (activeAgents < MAX_ACTIVE_AGENTS) {
-      const fileName = listPending().find((f) => !skipped.has(f) && !inFlightMessageIds.has(messageIdFromFileName(f)));
+    for (;;) {
+      const pending = listPending().filter((f) => !skipped.has(f) && !inFlightMessageIds.has(messageIdFromFileName(f)));
+      const fileName = activeAgents < MAX_ACTIVE_AGENTS ? pending[0] : pending.find(isQuickStatusMessage);
       if (!fileName) break;
       const messageId = messageIdFromFileName(fileName);
 
