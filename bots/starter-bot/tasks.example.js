@@ -1,6 +1,7 @@
 // 定时任务：每个任务到点调用 generateCopy() 生成文案，发给绑定的微信。改完执行 ./start.sh 重新加载。
 //   hour / minute：北京时间；workdaysOnly：只在周一到周五发
-//   memoryDigest: true：这条后面附上"记忆变动"（上次汇报以来记住、改了什么，可以回「撤销记忆 N」撤销）
+//   memoryDigest: true：这条发完另发一条"记忆变动"（上次汇报以来记住、改了什么，可以回「撤销记忆 N」撤销）；
+//     因为微信不让发而没送达的，对方当天回消息时补发一次
 import { fetchWeather } from '../../core/weather.js';
 import { callAiCopy } from '../../core/ai_copy.js';
 import { loadConfig } from '../../core/wechat_reply.js';

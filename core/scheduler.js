@@ -61,12 +61,21 @@ function saveState(state) {
   writeJsonAtomic(STATE_FILE, state);
 }
 
+// 现读现改现写：调度循环和补发可能同时在跑，各改各的字段，不拿手里旧的整份去覆盖
+function updateState(change) {
+  const state = loadState();
+  change(state);
+  saveState(state);
+  return state;
+}
+
 /**
  * 微信只允许机器人在对方最近一次发消息后的一段时间内（实测约 24 小时）主动发消息，超过就返回 prepare failed。
  *   - 对方超过 12 小时没发消息：下一条主动消息末尾请对方回一句（同一段只加一次，config.reply_nudge_hours 可调）
  *   - 发送被拒：记为"窗口已关"，不再生成文案、不再逐条报错，只告警一次；到点的提醒先留着
  *   - 对方发来新消息（forwarder 记下 last_user_message_at）：窗口重新打开，告警"已恢复"，留着的提醒补发
- * 状态在 data/state/reply_window.json：closed_at、closed_user_at、nudged_for
+ *   - 早间播报（标了 memoryDigest 的任务）当天没送达：对方当天回消息时补发一次（文案现写，带上记忆变动）；过了当天就不补
+ * 状态在 data/state/reply_window.json：closed_at、closed_user_at、nudged_for；没送达的播报记在 scheduler_state.json 的 missed
  */
 const NUDGE_AFTER_MS = Number(process.env.SCHEDULER_NUDGE_AFTER_MS) || 12 * 3600_000;
 const isWindowClosedError = (err) => /prepare failed/i.test(String(err?.message || ''));
@@ -106,6 +115,15 @@ function markReplyWindowClosed() {
     : `没有记录到${nick}最近一次发消息的时间`;
   console.warn(`[微信窗口已关闭] ${since}；主动消息先暂停，等${nick}回消息`);
   raiseAlert('user_window_closed', `${since}；微信拒绝了主动发送（prepare failed）`);
+}
+
+// 早间播报因为微信窗口关着没送达：记下来，对方当天回消息就补发一次。
+// missed：{ 任务 id: { date, at, digestOnly } }；digestOnly = 播报已经发出去了，只差"记忆变动"那一条
+function markMissed(task, todayStr, digestOnly = false) {
+  if (!task.memoryDigest) return;
+  updateState((s) => {
+    s.missed = { ...(s.missed || {}), [task.id]: { date: todayStr, at: hhmm(task), digestOnly } };
+  });
 }
 
 // 先记下"已提醒"再发，避免同一轮两条消息都带上；发送失败就用 undo 撤回这条记录
@@ -257,64 +275,144 @@ async function checkAndTrigger() {
 
       console.log(`\n⏰ [定时任务触发]: ${task.name} (${info.timeStr} 北京时间)`);
       state.last_fired[task.id] = todayStr;
-      saveState(state);
+      updateState((s) => {
+        s.last_fired = { ...(s.last_fired || {}), [task.id]: todayStr };
+      });
+      await deliverTask(task, { todayStr });
+    }
+  }
+}
 
+/**
+ * 发一个定时任务。标了 memoryDigest 的播报（早间天气）：播报一条，这个实例自己的"记忆变动"另发一条；
+ * 记忆变动没发出去就留到下一次一起列。微信窗口关着、没送达的早间播报记进 missed，对方当天回消息时补发。
+ *   late：补发时原本的时间（"08:30"），播报末尾写明是补发；digestOnly：播报已经发过了，只补记忆变动
+ * 返回 'sent' | 'window'（窗口关着，有东西留着等补发）| 'failed'
+ */
+async function deliverTask(task, { todayStr, late = '', digestOnly = false }) {
+  try {
+    const config = loadConfig();
+    const userId = config.authorized_user_id;
+
+    if (!userId) {
+      console.warn(`[跳过任务 ${task.id}]: 未找到 authorized_user_id，请先扫码绑定。`);
+      raiseAlert('task_failed', `定时任务「${task.name}」没发出去：实例未绑定授权用户`);
+      return 'failed';
+    }
+
+    // 对方太久没发消息、微信已经拒绝过主动发送：不白白生成文案，等对方回消息后恢复（早间播报当天补发）
+    if (replyWindow().closed_at) {
+      console.warn(`[跳过定时任务 ${task.id}]: 微信窗口已关闭，等${config.user_nickname || '用户'}回消息后恢复`);
+      appendLog(`[定时任务暂停] ${task.name}: 微信窗口已关闭`);
+      markMissed(task, todayStr, digestOnly);
+      return 'window';
+    }
+
+    // 每次发送都用最新的 context_token：现写文案可能要一两分钟，这期间对方也许发了新消息
+    const send = (text) => sendWechatReply(userId, loadRuntimeState('forwarder').last_context_token, text, config);
+    const msgText = digestOnly ? '' : await task.generateCopy();
+    const digest = !task.memoryDigest ? null : MEMORY_REVIEW ? memoryDigest() : MEMORY_MODE === 'managed' ? pendingDigest() : null;
+    const digestCount = digest ? digest.items?.length ?? digest.count : 0;
+    if (digestOnly && !digest) {
+      console.log(`[记忆变动不用补发]: ${task.name}，已经没有待发的了`);
+      return 'sent';
+    }
+    let sentText = '';
+
+    if (!digestOnly) {
+      const lateNote = late ? `\n（这条播报原本是今天 ${late} 的，当时微信不让${config.bot_name || '小助理'}主动发，现在补上。）` : '';
+      const text = `${msgText}${lateNote}`;
+      const nudge = withReplyNudge(text, config);
+      console.log(`[生成文案]: ${describeText(nudge.text)}${digest ? `（附记忆变动 ${digestCount} 条）` : ''}${nudge.text !== text ? '（末尾请对方回一句）' : ''}${late ? '（补发）' : ''}`);
       try {
-        const config = loadConfig();
-        const userId = config.authorized_user_id;
-        const contextToken = loadRuntimeState('forwarder').last_context_token;
+        await send(nudge.text);
+      } catch (sendErr) {
+        nudge.undo();
+        throw sendErr;
+      }
+      sentText = nudge.text;
+    }
 
-        if (!userId) {
-          console.warn(`[跳过任务 ${task.id}]: 未找到 authorized_user_id，请先扫码绑定。`);
-          raiseAlert('task_failed', `定时任务「${task.name}」没发出去：实例未绑定授权用户`);
-          continue;
-        }
-
-        // 对方太久没发消息、微信已经拒绝过主动发送：不白白生成文案，等对方回消息后恢复
-        if (replyWindow().closed_at) {
-          console.warn(`[跳过定时任务 ${task.id}]: 微信窗口已关闭，等${config.user_nickname || '用户'}回消息后恢复`);
-          appendLog(`[定时任务暂停] ${task.name}: 微信窗口已关闭`);
-          continue;
-        }
-
-        const msgText = await task.generateCopy();
-        // 标了 memoryDigest 的播报（早间天气）后面附上这个实例自己的"记忆变动"；没发出去就留到下一次一起列
-        const digest = !task.memoryDigest ? null : MEMORY_REVIEW ? memoryDigest() : MEMORY_MODE === 'managed' ? pendingDigest() : null;
-        const digestCount = digest ? digest.items?.length ?? digest.count : 0;
-        const fullText = digest ? `${msgText}\n\n${digest.text}` : msgText;
-        const nudge = withReplyNudge(fullText, config);
-        console.log(`[生成文案]: ${describeText(nudge.text)}${digest ? `（附记忆变动 ${digestCount} 条）` : ''}${nudge.text !== fullText ? '（末尾请对方回一句）' : ''}`);
-
+    let digestLeft = false;
+    if (digest) {
+      try {
+        await send(digest.text);
         try {
-          await sendWechatReply(userId, contextToken, nudge.text, config);
-        } catch (sendErr) {
-          nudge.undo();
-          throw sendErr;
+          // 自己管历史的记进度；被代管的实例写回执，主人的机器人看到后再记
+          if (MEMORY_REVIEW) markDigestDelivered(digest);
+          else saveRuntimeState('memory_digest_ack', { id: digest.id, delivered_at: Date.now() });
+        } catch (e) {
+          console.error('[记录记忆汇报进度失败]:', e.message);
         }
-        if (digest) {
-          try {
-            // 自己管历史的记进度；被代管的实例写回执，主人的机器人看到后再记
-            if (MEMORY_REVIEW) markDigestDelivered(digest);
-            else saveRuntimeState('memory_digest_ack', { id: digest.id, delivered_at: Date.now() });
-          } catch (e) {
-            console.error('[记录记忆汇报进度失败]:', e.message);
-          }
-        }
-        // 聊天日志里不写汇报的内容（免得被凌晨整理当成对话），只记条数
-        appendLog(`[定时任务成功] ${task.name}: ${digest ? `${msgText}（附记忆变动 ${digestCount} 条）` : nudge.text}`);
-        console.log(`✅ [定时任务下发完成]: ${task.name}\n`);
-      } catch (err) {
-        if (isWindowClosedError(err)) {
-          console.warn(`[定时任务未送达]: ${task.name}（微信窗口已关闭）`);
-          appendLog(`[定时任务未送达] ${task.name}: 微信窗口已关闭`);
+      } catch (e) {
+        digestLeft = true;
+        if (isWindowClosedError(e)) {
+          console.warn(`[记忆变动未送达]: ${task.name}（微信窗口已关闭），对方今天回消息后补发`);
           markReplyWindowClosed();
-          continue;
+          markMissed(task, todayStr, true);
+        } else {
+          console.error(`[记忆变动没发出去，留到下次一起列]: ${task.name}`, e.message);
         }
-        console.error(`❌ [定时任务执行失败]: ${task.name}`, err.message);
-        appendLog(`[定时任务失败] ${task.name}: ${err.message}`);
-        raiseAlert('task_failed', `定时任务「${task.name}」没发出去：${err.message}`);
+        if (digestOnly) return isWindowClosedError(e) ? 'window' : 'failed';
       }
     }
+
+    // 聊天日志里不写汇报的内容（免得被凌晨整理当成对话），只记条数
+    if (digestOnly) {
+      appendLog(`[记忆变动补发成功] ${task.name}: ${digestCount} 条`);
+      console.log(`✅ [记忆变动补发完成]: ${task.name}\n`);
+      return 'sent';
+    }
+    const what = !digest ? sentText : `${msgText}（${digestLeft ? `记忆变动 ${digestCount} 条没发出去，留着` : `附记忆变动 ${digestCount} 条`}）`;
+    appendLog(`[定时任务成功] ${task.name}${late ? '（补发）' : ''}: ${what}`);
+    console.log(`✅ [定时任务下发完成]: ${task.name}${late ? '（补发）' : ''}\n`);
+    return digestLeft && replyWindow().closed_at ? 'window' : 'sent';
+  } catch (err) {
+    if (isWindowClosedError(err)) {
+      console.warn(`[定时任务未送达]: ${task.name}（微信窗口已关闭）`);
+      appendLog(`[定时任务未送达] ${task.name}: 微信窗口已关闭`);
+      markReplyWindowClosed();
+      markMissed(task, todayStr, digestOnly);
+      return 'window';
+    }
+    console.error(`❌ [定时任务执行失败]: ${task.name}`, err.message);
+    appendLog(`[定时任务失败] ${task.name}: ${err.message}`);
+    raiseAlert('task_failed', `定时任务「${task.name}」没发出去：${err.message}`);
+    return 'failed';
+  }
+}
+
+// 对方回了消息、窗口重新打开：当天没送达的早间播报补发一次（文案现写，带上到现在为止的记忆变动）。
+// 不是今天的不补（隔天的天气没意义；记忆变动会跟着下一次播报一起列）
+let catchUpBusy = false;
+async function catchUpMissedBroadcasts() {
+  if (catchUpBusy) return;
+  const missed = loadState().missed || {};
+  if (!Object.keys(missed).length) return;
+  catchUpBusy = true;
+  try {
+    const todayStr = getBeijingInfo().dateStr;
+    const tasks = await loadBotTasks();
+    for (const [id, m] of Object.entries(missed)) {
+      const task = tasks.find((t) => t.id === id);
+      if (m?.date !== todayStr || !task?.memoryDigest) {
+        console.log(`[不再补发] ${task?.name || id}：${m?.date !== todayStr ? `是 ${m?.date} 的，已经过了当天` : '这个任务已经不在了'}`);
+        updateState((s) => {
+          if (s.missed) delete s.missed[id];
+        });
+        continue;
+      }
+      if (replyWindow().closed_at) continue;
+      console.log(`\n📮 [补发早间播报]: ${task.name}（原本 ${m.at}${m.digestOnly ? '，播报已经发了，只补记忆变动' : ''}）`);
+      const result = await deliverTask(task, { todayStr, late: m.at, digestOnly: Boolean(m.digestOnly) });
+      if (result !== 'window') {
+        updateState((s) => {
+          if (s.missed) delete s.missed[id];
+        });
+      }
+    }
+  } finally {
+    catchUpBusy = false;
   }
 }
 
@@ -877,9 +975,9 @@ async function startScheduler() {
   }
   console.log(` • [03:00] 每天 - 把昨天的聊天整理进记忆（失败自动重试；超上限的文件把旧条目搬去资料库）`);
   const memoryNote = {
-    owner: '记忆历史：定时检查所有实例的记忆改动并存版本，早间播报附上"记忆变动"',
-    standalone: '记忆历史：定时检查本实例的记忆改动并存版本（data/memory-history/），早间播报附上"记忆变动"',
-    managed: '改动汇报：早间播报附上管理服务准备好的汇报（记忆和设置的版本由管理服务统一存）',
+    owner: '记忆历史：定时检查所有实例的记忆改动并存版本，早间播报之后另发一条"记忆变动"',
+    standalone: '记忆历史：定时检查本实例的记忆改动并存版本（data/memory-history/），早间播报之后另发一条"记忆变动"',
+    managed: '改动汇报：早间播报之后另发一条管理服务准备好的汇报（记忆和设置的版本由管理服务统一存）',
     off: '记忆历史：没有开启（没装 git，或者设了 CLAWBOT_MEMORY_MODE=off）',
   }[MEMORY_MODE];
   console.log(` • ${memoryNote}`);
@@ -899,6 +997,7 @@ async function startScheduler() {
   setInterval(() => {
     heartbeat();
     checkReplyWindow();
+    catchUpMissedBroadcasts().catch((e) => console.error('[补发早间播报异常]:', e.message));
     checkAndTrigger().catch((e) => console.error('[调度循环异常]:', e.message));
     checkDynamicReminders().catch((e) => console.error('[动态提醒循环异常]:', e.message));
     checkNightlyMemoryConsolidation().catch((e) => console.error('[记忆固化循环异常]:', e.message));
@@ -912,6 +1011,7 @@ async function startScheduler() {
     }, Math.min(5000, SNAPSHOT_EVERY_MS / 2));
   }
 
+  catchUpMissedBroadcasts().catch((e) => console.error('[首次补发检查异常]:', e.message));
   checkAndTrigger().catch((e) => console.error('[首次检查异常]:', e.message));
   checkDynamicReminders().catch((e) => console.error('[首次动态检查异常]:', e.message));
   checkNightlyMemoryConsolidation().catch((e) => console.error('[首次记忆固化检查异常]:', e.message));
