@@ -37,9 +37,19 @@ node ../../core/login.js   # 用这个机器人要绑定的微信扫码
 
 `new_bot.sh` 从 `starter-bot` 的模板复制配置、人设、任务和专题，本地接口的密钥随机生成，端口不写就自动选一个没用过的。已经有的文件不会被覆盖。
 
+沙箱运行（见根目录 README）的机器人，新建后照样先扫码，然后用 `sudo bash deploy/sandbox/install_sandbox.sh switch <名字>` 切到沙箱，以后用 `systemctl` 管，不再运行 `start.sh`。
+
 ## 删除一个机器人
 
 ```bash
 pm2 delete <名字>-routine <名字>-forwarder <名字>-scheduler && pm2 save
 rm -r bots/<名字>
+```
+
+沙箱运行的：
+
+```bash
+sudo systemctl disable --now clawbot-routine@<名字> clawbot-forwarder@<名字> clawbot-scheduler@<名字>
+sudo userdel clawbot-<名字> && sudo rm -r /var/lib/clawbot/home/<名字> /etc/systemd/system/clawbot-<名字>.slice.d
+sudo rm -r bots/<名字>
 ```

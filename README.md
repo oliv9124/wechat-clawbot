@@ -61,6 +61,7 @@
 ├── LICENSE                   # MIT 许可证
 ├── scripts/new_bot.sh        # 新建一个机器人
 ├── deploy/set_alert_email.sh # 可选：配置告警邮件
+├── deploy/sandbox/           # 可选：沙箱运行（每个机器人一个低权限账号，需要 root）
 ├── core/                     # 所有机器人共用的程序（说明见 core/README.md）
 ├── skills-store/             # 技能商店：抖音、B站、小红书、转文字，每个机器人自己选装
 └── bots/
@@ -86,7 +87,7 @@ bash install.sh
 
 它会检查上面这些、安装 PM2 和 `core/` 的依赖，并把 `bots/starter-bot` 准备好（生成 `config.json`、`MEMORY.md`、`tasks.js`、`topics.json`，本地接口的密钥随机生成）。
 
-> 建议用普通账号运行，不要用 root：智能体会以运行它的账号的权限执行命令。
+> 建议用普通账号运行，不要用 root：智能体会以运行它的账号的权限执行命令。有 root 的服务器更推荐下面的“沙箱运行”：每个机器人一个低权限账号，互相看不到。
 
 ### 2. 扫码绑定微信
 
@@ -163,6 +164,30 @@ node ../../core/login.js                # 用另一个微信扫码
 
 ---
 
+## 沙箱运行（推荐，需要 root）
+
+`./start.sh` 用 PM2 以当前账号运行，智能体能做这个账号能做的一切，几个机器人之间也互相看得到。有 root 的服务器建议改成沙箱运行，每个机器人一个低权限系统账号，由 systemd 托管：
+
+- 只能写自己的机器人目录和自己的家目录；系统和程序代码只读，不能提权；
+- 看不到 `/root`、`/home`、其他机器人的目录和微信凭证，也可以把这台服务器上别的项目（网站、数据库）一起藏起来；
+- 每个机器人有 CPU、内存上限，一个跑飞了也拖不垮整台机器。
+
+```bash
+sudo bash deploy/sandbox/install_sandbox.sh plan              # 先看：检查前提、列出每一步要做什么，什么都不改
+sudo bash deploy/sandbox/install_sandbox.sh prepare           # 一次性准备（可以重复跑）
+sudo bash deploy/sandbox/install_sandbox.sh switch work-bot   # 逐个切换：等它空闲，从 PM2 切到沙箱，几秒钟，消息不会丢
+sudo bash deploy/sandbox/install_sandbox.sh check work-bot    # 在它的沙箱里逐项验证（加 SKILL_TESTS=1 再试抖音下载、转文字）
+sudo bash deploy/sandbox/install_sandbox.sh rollback work-bot # 退回 PM2
+```
+
+- 程序放在 `/root` 或 `/home` 下面时，`prepare` 会把它搬到 `/opt/wechat-clawbot`（可以在 `sandbox.conf` 里用 `TARGET` 改），旧路径留一个软链接。
+- 每个账号复制一份 agy 程序和登录（同一个 Google 账号，不用重新登录），以后各自更新 agy。agy 登录失效时，在原来的账号重新登录一次，再执行 `sudo bash deploy/sandbox/install_sandbox.sh sync-login`。
+- 本机设置写在 `/etc/clawbot/sandbox.conf`，比如 `HIDE="-/var/lib/docker -/www -/srv/其他项目"`（沙箱里看不到的路径）、`MEM=1G CPU=100%`（每个机器人的上限）。
+- 切换以后用 systemd 管：`systemctl status 'clawbot-*@work-bot'` 看状态，`journalctl -u clawbot-routine@work-bot -f` 看日志，`systemctl restart 'clawbot-*@work-bot'` 重启。**不要再运行这个机器人的 `start.sh`**，它会用 PM2 再起一套，和沙箱里的抢端口。
+- 需要 systemd 239 以上（AlmaLinux / CentOS 8、Ubuntu 20.04 起都可以）。
+
+---
+
 ## 告警（可选）
 
 ```bash
@@ -180,7 +205,7 @@ pm2 start ecosystem.monitor.cjs && pm2 save
 - **超过一天没给它发消息，它就不发提醒了？** 微信只允许机器人在你最近一次发消息后约 24 小时内主动发消息。快到时它会在消息末尾请你回一句；真的过了，提醒会先留着，你一回消息就补发；当天没发出去的早间播报也会补发一次。
 - **能拉进群里用吗？** 不能。微信 ClawBot 目前只支持一对一聊天。
 - **微信登录过期**：在机器人目录执行 `node ../../core/login.js` 重新扫码。
-- **智能体登录失效**（日志里有 Google 登录链接）：用运行机器人的账号执行 `agy -p "登录测试"`，按提示重新授权。
+- **智能体登录失效**（日志里有 Google 登录链接）：用运行机器人的账号执行 `agy -p "登录测试"`，按提示重新授权。沙箱运行的，在原来的账号重新授权后执行 `sudo bash deploy/sandbox/install_sandbox.sh sync-login`。
 - **日志里看不到消息内容？** 默认不记录消息原文和令牌。排查问题时可以临时设环境变量 `CLAWBOT_LOG_CONTENT=1`。
 
 ---
@@ -189,9 +214,9 @@ pm2 start ecosystem.monitor.cjs && pm2 save
 
 - 只有扫码绑定的微信能使用机器人；本地接口只监听 127.0.0.1，并且要带随机密钥。
 - 提示词（里面有聊天内容和记忆）经标准输入交给智能体，不放在命令行参数里，同一台机器上的其他账号从进程列表里看不到。
-- 微信里不能远程升级或重启程序，更新代码请在服务器上 `git pull` 后执行 `./start.sh`。
+- 微信里不能远程升级或重启程序，更新代码请在服务器上 `git pull` 后执行 `./start.sh`（沙箱运行的改用 `systemctl restart 'clawbot-*@<名字>'`）。
 - 微信凭证、聊天记录、记忆都只存在你自己的服务器上，直连腾讯官方 iLink 节点。
-- 进阶：可以用 systemd 托管，并给每个机器人一个单独的系统账号和沙箱（只能写自己的目录），这样一个机器人即使被诱导执行了危险命令，也碰不到其他机器人和系统。
+- 有 root 的服务器建议用上面的“沙箱运行”：每个机器人一个低权限系统账号，一个机器人即使被诱导执行了危险命令，也碰不到其他机器人和系统。
 
 ---
 
