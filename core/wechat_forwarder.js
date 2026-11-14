@@ -5,12 +5,17 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT } from './wechat_reply.js';
+import { loadConfig, getConfigPath, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT } from './wechat_reply.js';
 import { enqueueInbox } from './inbox.js';
 import { raiseAlert } from './alert.js';
 
 // 凭证过期后多久再试一次：退出重启只会每几秒撞一次接口，没有意义（环境变量仅供测试缩短）
 const CREDENTIAL_RETRY_MS = Number(process.env.FORWARDER_CREDENTIAL_RETRY_MS) || 10 * 60 * 1000;
+// 没有上次的读取位置、只能从头收时（新装、重新扫码、旧版留下的位置太旧），微信会把最近一段时间的旧消息再给一遍。
+// 这时启动前这么久以前的消息只记日志、不处理（环境变量仅供测试）
+const STALE_MESSAGE_MS = Number(process.env.FORWARDER_STALE_MESSAGE_MS) || 10 * 60 * 1000;
+// 旧版把读取位置记在 config.json 里，每次收消息都会写一遍。config.json 在这段时间内写过，才接着用旧版的位置
+const LEGACY_CURSOR_MAX_AGE_MS = Number(process.env.FORWARDER_LEGACY_CURSOR_MAX_AGE_MS) || 24 * 60 * 60 * 1000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
@@ -114,6 +119,44 @@ async function downloadAndDecryptMedia(itemObj, defaultExt = '.bin', customFileN
   }
 }
 
+function agoText(ms) {
+  const min = Math.max(0, Math.round(ms / 60000));
+  if (min < 60) return `${min} 分钟前`;
+  const hours = Math.round(min / 60);
+  return hours < 48 ? `${hours} 小时前` : `${Math.round(hours / 24)} 天前`;
+}
+
+/**
+ * 启动时决定从哪个读取位置（get_updates_buf）接着收消息：
+ *   - data/state/forwarder.json 里有这一项：照用。重新扫码后它被清成 ''，就从头收；
+ *   - 从来没有这一项（旧版刚升级上来），config.json 里有旧版留下的位置，而且 config.json 最近 24 小时内写过：
+ *     把位置搬进 data/state/forwarder.json 接着收，升级时不会把收过的消息再收一遍（config.json 不动）；
+ *   - 都没有：从头收。
+ * 返回 { cursor, fresh }：fresh 为 true 表示从头收，微信补给的旧消息要跳过。
+ */
+function resolveStartCursor(config) {
+  const state = loadRuntimeState('forwarder');
+  if (typeof state.get_updates_buf === 'string') {
+    return { cursor: state.get_updates_buf, fresh: !state.get_updates_buf };
+  }
+  const legacy = typeof config.get_updates_buf === 'string' ? config.get_updates_buf : '';
+  if (legacy) {
+    let ageMs = Infinity;
+    try {
+      ageMs = Date.now() - fs.statSync(getConfigPath()).mtimeMs;
+    } catch {}
+    if (ageMs <= LEGACY_CURSOR_MAX_AGE_MS) {
+      const moved = { get_updates_buf: legacy };
+      if (!state.last_context_token && config.last_context_token) moved.last_context_token = config.last_context_token;
+      saveRuntimeState('forwarder', moved);
+      console.log('[升级] 接上了旧版记在 config.json 里的读取位置，收过的消息不会再收一遍。');
+      return { cursor: legacy, fresh: false };
+    }
+    console.log(`[升级] config.json 里旧版的读取位置是 ${agoText(ageMs)}写的，太旧不用，从头收。`);
+  }
+  return { cursor: '', fresh: true };
+}
+
 async function startPolling() {
   let config = loadConfig();
 
@@ -128,7 +171,13 @@ async function startPolling() {
   console.log(`已绑定用户: ${config.authorized_user_id || '（未绑定，将拒收所有消息，请运行 login.js 扫码绑定）'}`);
   console.log(`消息收件箱: ${path.join(botRoot, 'data', 'inbox', 'pending')}`);
 
-  let getUpdatesBuf = loadRuntimeState('forwarder').get_updates_buf || '';
+  const start = resolveStartCursor(config);
+  let getUpdatesBuf = start.cursor;
+  // 从头收时，比这个时间早的消息是微信补给的旧消息（已经回答过，或者早就过时了），跳过
+  const staleBefore = start.fresh ? Date.now() - STALE_MESSAGE_MS : 0;
+  if (start.fresh) {
+    console.log(`[从头收] 没有上次的读取位置，微信会把最近的旧消息再给一遍：启动前 ${Math.round(STALE_MESSAGE_MS / 60000)} 分钟以前的只记日志、不处理。`);
+  }
   // 登录状态：unknown（刚启动）/ ok / expired。变成 expired 时告警一次；之后第一次拉取成功就报"正常"。
   // 刚启动时也报一次"正常"：主人重新扫码后服务会重启，监控靠这一条知道已经恢复
   let credentialState = 'unknown';
@@ -227,6 +276,14 @@ async function startPolling() {
         const messageId = `${msg.message_id ?? fromUser}-${msg.create_time_ms ?? ''}`;
         if (seenIds.has(messageId)) {
           console.log(`[去重] 消息 ${messageId} 已经收过，跳过。`);
+          continue;
+        }
+
+        // 从头收时微信补给的旧消息：只记一笔（也记进去重表），不交给机器人，也不算对方最近发过消息
+        const createdAt = Number(msg.create_time_ms) || 0;
+        if (staleBefore && createdAt && createdAt < staleBefore) {
+          console.log(`[跳过旧消息] message_id=${msg.message_id} 是 ${agoText(Date.now() - createdAt)}的消息，这次是从头收，不处理。`);
+          seenIds.add(messageId);
           continue;
         }
 

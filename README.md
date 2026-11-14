@@ -62,7 +62,7 @@
 ├── scripts/new_bot.sh        # 新建一个机器人
 ├── deploy/set_alert_email.sh # 可选：配置告警邮件
 ├── core/                     # 所有机器人共用的程序（说明见 core/README.md）
-├── skills/                   # 技能：短视频下载与文案提取、小红书
+├── skills-store/             # 技能商店：抖音、B站、小红书、转文字，每个机器人自己选装
 └── bots/
     ├── README.md             # 机器人目录的说明
     └── starter-bot/          # 第一个机器人（也是新建机器人的模板）
