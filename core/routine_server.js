@@ -1199,7 +1199,8 @@ async function handleWechatTask(task) {
 
           const latestConfig = loadConfig();
           const toUser = latestConfig.authorized_user_id || from_user_id;
-          const targetToken = loadRuntimeState('forwarder').last_context_token || context_token;
+          // 先用这条消息自己的回复凭证（每个凭证只能用 8~10 次，别都挤在最新那条上）；用满了发送函数会换最近的其他凭证
+          const targetToken = context_token || loadRuntimeState('forwarder').last_context_token;
 
           // 【第 2 段消息】：终结结果推送，单任务一生仅发这最后一条，杜绝任何碎片骚扰
           const headerPrefix = `🔔 【后台任务完成通知】\n${userNickname}，您交办的长任务已全部处理完成：\n\n`;
@@ -1218,7 +1219,7 @@ async function handleWechatTask(task) {
           console.error(`❌ [后台长任务执行异常]: ${taskLabel}`, execErr.message);
           const latestConfig = loadConfig();
           const toUser = latestConfig.authorized_user_id || from_user_id;
-          const targetToken = loadRuntimeState('forwarder').last_context_token || context_token;
+          const targetToken = context_token || loadRuntimeState('forwarder').last_context_token;
 
           const errorNotice = execErr.agentFailure === 'auth'
             ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`

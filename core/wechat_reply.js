@@ -236,27 +236,131 @@ export async function sendWechatTyping(userId, contextToken, status = 1, overrid
   }
 }
 
+// ---------------------------------------------------------------------------
+// 回复凭证（context_token）
+// 用户每发一条消息，微信给一个 context_token，机器人发任何消息都要带上一个。实测每个 token 大约 24 小时内有效，
+// 而且只能用 8~10 次（文字、图片、文件各算一次）；用满了再用，微信返回 ret=-2 prepare failed。
+// forwarder 把最近 24 小时每条消息的 token 记在 data/state/forwarder.json 的 recent_context_tokens 里；
+// 发送时先用指定的 token，被拒（prepare failed）就换最近的其他 token 再试（新的在前），全被拒才算失败。
+// 被拒过的 token 只存哈希，记在 data/state/used_up_tokens.<进程>.json：每个进程只写自己的文件，读的时候合在一起。
+// ---------------------------------------------------------------------------
+export const TOKEN_TTL_MS = Number(process.env.CLAWBOT_TOKEN_TTL_MS) || 24 * 3600_000 - 10 * 60_000;
+export const RECENT_TOKENS_MAX = 30;
+const tokenKey = (t) => crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 16);
+export const isPrepareFailed = (err) => /prepare failed/i.test(String(err?.message || ''));
+const processRole = () => path.basename(process.argv[1] || 'process', '.js').replace(/[^A-Za-z0-9_-]/g, '_');
+const tokenStateDir = (botDir) => path.join(botDir || process.cwd(), 'data', 'state');
+
+// 合并新收到的 token：同一个只留一份，丢掉超过有效期的，最多留最近 30 个（forwarder 用）
+export function mergeRecentTokens(list, added, now = Date.now()) {
+  const byToken = new Map();
+  for (const x of [...(Array.isArray(list) ? list : []), ...added]) {
+    if (!x?.token) continue;
+    const at = Number(x.at) || now;
+    if (now - at >= TOKEN_TTL_MS) continue;
+    if (!byToken.has(x.token) || byToken.get(x.token).at < at) byToken.set(x.token, { token: x.token, at });
+  }
+  return [...byToken.values()].sort((a, b) => a.at - b.at).slice(-RECENT_TOKENS_MAX);
+}
+
+// 读实例目录里的 JSON：不跟随软链接（监控、管理服务以 root 替别的机器人发时也会读，不能被链接指到别处）
+function readBotJson(p) {
+  let fd;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    return JSON.parse(fs.readFileSync(fd, 'utf-8'));
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+// 最近 24 小时里还在有效期内的 token，新的在前；没有记录时退回 last_context_token
+export function recentContextTokens(botDir = null) {
+  const st = readBotJson(path.join(tokenStateDir(botDir), 'forwarder.json')) || {};
+  const now = Date.now();
+  const out = (Array.isArray(st.recent_context_tokens) ? st.recent_context_tokens : [])
+    .filter((x) => x?.token && now - (Number(x.at) || 0) < TOKEN_TTL_MS)
+    .sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))
+    .map((x) => x.token);
+  if (st.last_context_token && !out.includes(st.last_context_token)) out.unshift(st.last_context_token);
+  return out;
+}
+
+const usedUpInMemory = new Map(); // 实例目录 → 这个进程认定用满的 token 哈希
+function usedUpKeys(botDir) {
+  const dir = tokenStateDir(botDir);
+  const keys = new Set(usedUpInMemory.get(dir) || []);
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((f) => /^used_up_tokens\..+\.json$/.test(f));
+  } catch {}
+  const now = Date.now();
+  for (const f of names) {
+    for (const [k, at] of Object.entries(readBotJson(path.join(dir, f)) || {})) {
+      if (now - Number(at) < TOKEN_TTL_MS + 3600_000) keys.add(k);
+    }
+  }
+  return keys;
+}
+function markTokenUsedUp(botDir, token) {
+  const dir = tokenStateDir(botDir);
+  const k = tokenKey(token);
+  if (!usedUpInMemory.has(dir)) usedUpInMemory.set(dir, new Set());
+  usedUpInMemory.get(dir).add(k);
+  // 替别的机器人发（监控、管理服务，以 root 运行）：只记在内存里，不往那个机器人的目录写文件
+  if (botDir) return;
+  try {
+    const file = path.join(dir, `used_up_tokens.${processRole()}.json`);
+    let d = {};
+    try {
+      d = JSON.parse(fs.readFileSync(file, 'utf-8')) || {};
+    } catch {}
+    const now = Date.now();
+    for (const [kk, at] of Object.entries(d)) if (now - Number(at) > TOKEN_TTL_MS + 3600_000) delete d[kk];
+    d[k] = now;
+    writeJsonAtomic(file, d);
+  } catch {
+    // 写不了（比如在只读的沙箱里）就只记在这个进程的内存里
+  }
+}
+
 /**
- * Send reply text message back to WeChat via iLink sendmessage API.
+ * 换着 token 发：先用 preferred，再用最近 24 小时里的其他 token（新的在前），跳过已知用满的。
+ * send(token) 成功就返回；只有 prepare failed 才换下一个，其他错误直接抛出。
+ * 全被拒时抛出最后那个 prepare failed，并带上 allTokensUsedUp = true、tried = 试了几个。
  */
-export async function sendWechatReply(toUserId, contextToken, replyText, overrideConfig) {
-  const config = overrideConfig || loadConfig();
-  const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
-  const token = config.bot_token;
-
-  if (!token) {
-    throw new Error('未配置 bot_token，请先完成扫码登录！');
+export async function sendWithTokenFallback(preferred, send, { botDir = null, label = '消息' } = {}) {
+  const all = [];
+  for (const t of [preferred, ...recentContextTokens(botDir)]) if (t && !all.includes(t)) all.push(t);
+  if (!all.length) throw new Error('缺少 context_token，无法回复微信消息！');
+  const usedUp = usedUpKeys(botDir);
+  const fresh = all.filter((t) => !usedUp.has(tokenKey(t)));
+  // 都记成用满了：还是拿最新的试一次（记录可能过时），免得一直卡住
+  const order = fresh.length ? fresh : all.slice(0, 1);
+  let lastErr = null;
+  let tried = 0;
+  for (const t of order) {
+    tried += 1;
+    try {
+      const res = await send(t);
+      if (t !== preferred) console.log(`[回复凭证] ${label}：${preferred ? '原来那个凭证用满了，' : ''}换用最近第 ${all.indexOf(t) + 1} 个凭证发出`);
+      return res;
+    } catch (err) {
+      if (!isPrepareFailed(err)) throw err;
+      lastErr = err;
+      markTokenUsedUp(botDir, t);
+    }
   }
-  if (!contextToken) {
-    throw new Error('缺少 context_token，无法回复微信消息！');
-  }
+  const err = lastErr || new Error('sendmessage failed: prepare failed');
+  err.allTokensUsedUp = true;
+  err.tried = tried;
+  throw err;
+}
 
-  const plainText = stripMarkdown(replyText);
-  const endpoint = `${baseUrl.replace(/\/+$/, '')}/ilink/bot/sendmessage`;
-
-  const clientId = `openclaw-weixin:${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-
-  const headers = {
+function ilinkHeaders(token) {
+  return {
     'Content-Type': 'application/json',
     AuthorizationType: 'ilink_bot_token',
     Authorization: `Bearer ${token.trim()}`,
@@ -264,15 +368,50 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
     'iLink-App-Id': 'bot',
     'iLink-App-ClientVersion': '132106',
   };
+}
 
-  const payload = {
+// 发 sendmessage：返回不是 ret=0 就抛错（文字、图片、文件、视频共用，prepare failed 才能被发现、换凭证）
+async function postSendmessage(config, req, label = 'sendmessage') {
+  const baseUrl = (config.base_url || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
+  const res = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
+    method: 'POST',
+    headers: ilinkHeaders(config.bot_token),
+    body: JSON.stringify(req),
+  });
+  const raw = await res.text();
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    json = { raw };
+  }
+  if (!res.ok || (json.ret !== undefined && json.ret !== 0) || (json.errcode !== undefined && json.errcode !== 0)) {
+    console.error(`[${label} failed]`, res.status, raw.slice(0, 300));
+    throw new Error(`${label} failed: HTTP ${res.status} ${raw.slice(0, 300)}`);
+  }
+  return json;
+}
+
+/**
+ * Send reply text message back to WeChat via iLink sendmessage API.
+ * opts.botDir：用哪个实例目录里的回复凭证（默认当前目录；监控替别的机器人发时传它的目录）
+ */
+export async function sendWechatReply(toUserId, contextToken, replyText, overrideConfig, opts = {}) {
+  const config = overrideConfig || loadConfig();
+  if (!config.bot_token) {
+    throw new Error('未配置 bot_token，请先完成扫码登录！');
+  }
+
+  const plainText = stripMarkdown(replyText);
+  // 每次尝试都用新的 client_id：换了凭证的重发不能被当成同一条
+  const payload = (ctx) => ({
     msg: {
       from_user_id: '',
       to_user_id: toUserId,
-      client_id: clientId,
+      client_id: `openclaw-weixin:${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
       message_type: 2,
       message_state: 2,
-      context_token: contextToken,
+      context_token: ctx,
       item_list: [
         {
           type: 1,
@@ -286,29 +425,10 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
       channel_version: '2.4.10',
       bot_agent: 'OpenClaw',
     },
-  };
-
-  console.log(`[sendmessage 发送给微信]: to=${toUserId} 文本 ${describeText(plainText)}`);
-
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
   });
 
-  const raw = await res.text();
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    json = { raw };
-  }
-
-  if (!res.ok || (json.ret !== undefined && json.ret !== 0) || (json.errcode !== undefined && json.errcode !== 0)) {
-    console.error('[sendmessage failed]', res.status, raw.slice(0, 300));
-    throw new Error(`sendmessage failed: HTTP ${res.status} ${raw.slice(0, 300)}`);
-  }
-
+  console.log(`[sendmessage 发送给微信]: to=${toUserId} 文本 ${describeText(plainText)}`);
+  const json = await sendWithTokenFallback(contextToken, (ctx) => postSendmessage(config, payload(ctx)), { botDir: opts.botDir, label: '文字' });
   console.log(`[sendmessage success] to=${toUserId} msg_id=${json.message_id || 'ok'}`);
   return json;
 }
@@ -316,7 +436,7 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
 /**
  * Upload a local image to Tencent Weixin C2C CDN and send as an image message.
  */
-export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath, overrideConfig) {
+export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath, overrideConfig, opts = {}) {
   const config = overrideConfig || loadConfig();
   const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
   const token = config.bot_token;
@@ -414,20 +534,12 @@ export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath
     base_info: { channel_version: '2.4.10', bot_agent: 'OpenClaw' },
   };
 
-  const sendRes = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      AuthorizationType: 'ilink_bot_token',
-      Authorization: `Bearer ${token.trim()}`,
-      'X-WECHAT-UIN': randomWechatUin(),
-      'iLink-App-Id': 'bot',
-      'iLink-App-ClientVersion': '132106',
-    },
-    body: JSON.stringify(sendReq),
-  });
-
-  const sendData = await sendRes.json();
+  // 只有最后这一步用到回复凭证：被拒就换凭证重发，不用重新上传
+  const sendData = await sendWithTokenFallback(contextToken, (ctx) => {
+    sendReq.msg.context_token = ctx;
+    sendReq.msg.client_id = `openclaw-weixin:${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    return postSendmessage(config, sendReq, 'sendImage');
+  }, { botDir: opts.botDir, label: '图片' });
   console.log(`[sendImage success] to=${toUserId} msg_id=${sendData.message_id || 'ok'}`);
   return sendData;
 }
@@ -435,7 +547,7 @@ export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath
 /**
  * Upload a local document/file to Tencent Weixin C2C CDN and send as a file message.
  */
-export async function uploadAndSendWechatFile(toUserId, contextToken, filePath, overrideConfig) {
+export async function uploadAndSendWechatFile(toUserId, contextToken, filePath, overrideConfig, opts = {}) {
   const config = overrideConfig || loadConfig();
   const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
   const token = config.bot_token;
@@ -532,20 +644,12 @@ export async function uploadAndSendWechatFile(toUserId, contextToken, filePath, 
     base_info: { channel_version: '2.4.10', bot_agent: 'OpenClaw' },
   };
 
-  const sendRes = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      AuthorizationType: 'ilink_bot_token',
-      Authorization: `Bearer ${token.trim()}`,
-      'X-WECHAT-UIN': randomWechatUin(),
-      'iLink-App-Id': 'bot',
-      'iLink-App-ClientVersion': '132106',
-    },
-    body: JSON.stringify(sendReq),
-  });
-
-  const sendData = await sendRes.json();
+  // 只有最后这一步用到回复凭证：被拒就换凭证重发，不用重新上传
+  const sendData = await sendWithTokenFallback(contextToken, (ctx) => {
+    sendReq.msg.context_token = ctx;
+    sendReq.msg.client_id = `openclaw-weixin-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    return postSendmessage(config, sendReq, 'sendFile');
+  }, { botDir: opts.botDir, label: '文件' });
   console.log(`[sendFile success] to=${toUserId} file=${describePath(filePath)} msg_id=${sendData.message_id || 'ok'}`);
   return sendData;
 }
@@ -632,7 +736,7 @@ export async function uploadBufferToCdn(buf, media_type, toUserId, overrideConfi
  * Displays thumbnail + play button in WeChat chat window; tap to play directly in full screen.
  * Automatically falls back to file card (type: 4) if native video payload fails.
  */
-export async function uploadAndSendWechatVideo(toUserId, contextToken, videoPath, overrideConfig) {
+export async function uploadAndSendWechatVideo(toUserId, contextToken, videoPath, overrideConfig, opts = {}) {
   const config = overrideConfig || loadConfig();
   const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
   const token = config.bot_token;
@@ -725,28 +829,19 @@ export async function uploadAndSendWechatVideo(toUserId, contextToken, videoPath
       base_info: { channel_version: '2.4.10', bot_agent: 'OpenClaw' },
     };
 
-    const sendRes = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        AuthorizationType: 'ilink_bot_token',
-        Authorization: `Bearer ${token.trim()}`,
-        'X-WECHAT-UIN': randomWechatUin(),
-        'iLink-App-Id': 'bot',
-        'iLink-App-ClientVersion': '132106',
-      },
-      body: JSON.stringify(sendReq),
-    });
-
-    const sendData = await sendRes.json();
-    if ((sendData.ret !== undefined && sendData.ret !== 0) || (sendData.errcode !== undefined && sendData.errcode !== 0)) {
-      throw new Error(`sendVideo failed: ${JSON.stringify(sendData)}`);
-    }
+    // 只有最后这一步用到回复凭证：被拒就换凭证重发，不用重新上传
+    const sendData = await sendWithTokenFallback(contextToken, (ctx) => {
+      sendReq.msg.context_token = ctx;
+      sendReq.msg.client_id = `openclaw-weixin-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      return postSendmessage(config, sendReq, 'sendVideo');
+    }, { botDir: opts.botDir, label: '视频' });
 
     console.log(`[sendVideo success] 原生小视频发送成功！to=${toUserId} msg_id=${sendData.message_id || 'ok'}`);
     return sendData;
   } catch (err) {
+    // 回复凭证全用满了：换成文件发也一样会被拒，直接报出去
+    if (isPrepareFailed(err)) throw err;
     console.warn(`[原生视频消息发送异常，安全降级为文件卡片发送]:`, err.message);
-    return await uploadAndSendWechatFile(toUserId, contextToken, videoPath, config);
+    return await uploadAndSendWechatFile(toUserId, contextToken, videoPath, config, opts);
   }
 }

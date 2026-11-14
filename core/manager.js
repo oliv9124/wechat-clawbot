@@ -93,7 +93,7 @@ async function handleRequest(botRoot, req, admin, bots) {
   } else {
     return;
   }
-  await withTimeout(sendWechatReply(req.from_user_id, req.context_token, reply, cfg), SEND_TIMEOUT_MS);
+  await withTimeout(sendWechatReply(req.from_user_id, req.context_token, reply, cfg, { botDir: botRoot }), SEND_TIMEOUT_MS);
   console.log(`[管理指令] ${bot}：${req.type === 'show' ? `查看${req.bot && req.bot !== bot ? ` ${req.bot} 的` : ''}改动` : '撤销'}，已回复`);
 }
 
@@ -123,7 +123,7 @@ async function requestCycle() {
           console.error(`[管理指令失败] ${path.basename(botRoot)}:`, err.message);
           try {
             const cfg = loadBotSettings(botRoot);
-            await withTimeout(sendWechatReply(req.from_user_id, req.context_token, '这条指令没有执行成功，原因记在管理服务的日志里了，稍后再试一次。', cfg), SEND_TIMEOUT_MS);
+            await withTimeout(sendWechatReply(req.from_user_id, req.context_token, '这条指令没有执行成功，原因记在管理服务的日志里了，稍后再试一次。', cfg, { botDir: botRoot }), SEND_TIMEOUT_MS);
           } catch {}
         }
       }

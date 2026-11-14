@@ -150,10 +150,15 @@ const EVENTS = {
   },
   tasks_config_ok: { key: 'tasks_config', recovery: true, title: '定时任务配置（tasks.js）已恢复' },
   // 微信只允许机器人在对方最近一次发消息后约 24 小时内主动发消息；标题和建议里用实例自己的称呼
+  // 两种原因：太久没发消息（超过约 24 小时）；或者最近消息的回复凭证都用满了（每个只能用 8~10 次），调度器在详情里写明
   user_window_closed: {
     key: 'user_window', sticky: true, dedupeMs: WINDOW_DEDUPE_MS,
-    title: (b) => `${b.user}太久没给${b.display}发消息，${b.display}暂时发不出消息了`,
-    advice: (b) => `微信只允许机器人在对方最近一次发消息后约 24 小时内主动发消息。让${b.user}给${b.display}随便发一句话就能恢复；这期间${b.user}自己设的提醒会先留着，恢复后补发。`,
+    title: (b, ev) => (String(ev?.detail || '').includes('回复凭证都用满了')
+      ? `${b.display}最近的回复凭证都用满了，暂时发不出消息`
+      : `${b.user}太久没给${b.display}发消息，${b.display}暂时发不出消息了`),
+    advice: (b, ev) => (String(ev?.detail || '').includes('回复凭证都用满了')
+      ? `微信给${b.user}发来的每条消息一个回复凭证，每个只能用 8~10 次；最近的都用完了。让${b.user}给${b.display}随便发一句话就能恢复；这期间${b.user}自己设的提醒会先留着，恢复后补发。`
+      : `微信只允许机器人在对方最近一次发消息后约 24 小时内主动发消息。让${b.user}给${b.display}随便发一句话就能恢复；这期间${b.user}自己设的提醒会先留着，恢复后补发。`),
   },
   user_window_ok: { key: 'user_window', recovery: true, title: (b) => `${b.user}回消息了，${b.display}恢复正常` },
 };
@@ -229,9 +234,9 @@ function checkBot(outgoing, bot, dedupeMs) {
     if (!ev) continue;
     const meta = EVENTS[ev.kind] || { key: ev.kind, event: true, title: `其他问题（${ev.kind}）` };
     notify(outgoing, `${bot.name}:${meta.key}`, {
-      ...base, at: ev.at || now, title: typeof meta.title === 'function' ? meta.title(bot) : meta.title, detail: ev.detail,
+      ...base, at: ev.at || now, title: typeof meta.title === 'function' ? meta.title(bot, ev) : meta.title, detail: ev.detail,
       recovery: Boolean(meta.recovery), sticky: Boolean(meta.sticky), event: Boolean(meta.event),
-      advice: meta.advice ? meta.advice(bot) : '',
+      advice: meta.advice ? meta.advice(bot, ev) : '',
       ...(meta.dedupeMs ? { dedupeMs: meta.dedupeMs } : {}),
     }, meta.dedupeMs || dedupeMs);
   }
@@ -538,7 +543,8 @@ async function viaWechat(cfg, text, bot) {
     return { status: 'skipped', text: `微信跳过（${userName}太久没给${viaName}发消息，微信不让它主动发）` };
   }
   try {
-    await withTimeout(sendWechatReply(viaConfig.authorized_user_id, viaState.last_context_token, text, viaConfig), SEND_TIMEOUT_MS);
+    // 用那个机器人最近的回复凭证：最新的用满了，发送函数会换它最近的其他凭证
+    await withTimeout(sendWechatReply(viaConfig.authorized_user_id, viaState.last_context_token, text, viaConfig, { botDir: viaDir }), SEND_TIMEOUT_MS);
     return { status: 'sent', text: '微信已发' };
   } catch (err) {
     if (/prepare failed/i.test(String(err.message))) {

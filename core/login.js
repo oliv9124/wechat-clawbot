@@ -103,7 +103,7 @@ async function main() {
           authorized_user_id: statusRes.ilink_user_id || '',
         });
         // 新凭证对应新的同步进度和上下文，清空 forwarder 的运行时状态
-        saveRuntimeState('forwarder', { get_updates_buf: '', last_context_token: '' });
+        saveRuntimeState('forwarder', { get_updates_buf: '', last_context_token: '', recent_context_tokens: [] });
         if (!statusRes.ilink_user_id) {
           console.warn('⚠️ 扫码结果里没有用户 ID：机器人会拒收所有消息，请重新扫码绑定。');
         }

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, getConfigPath, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT } from './wechat_reply.js';
+import { loadConfig, getConfigPath, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT, mergeRecentTokens } from './wechat_reply.js';
 import { enqueueInbox } from './inbox.js';
 import { raiseAlert } from './alert.js';
 
@@ -248,6 +248,8 @@ async function startPolling() {
       const msgs = data.msgs || [];
       const seenIds = new Set(loadRuntimeState('forwarder').recent_message_ids || []);
       let latestContextToken = null;
+      // 这一批每条消息的回复凭证：每个凭证只能用 8~10 次，都记下来，发送时一个用满了可以换下一个
+      const newTokens = [];
       let latestUserMessageAt = 0;
       for (const msg of msgs) {
         // 默认只记事件概要；完整事件里有消息原文、context_token 和媒体解密密钥
@@ -289,6 +291,7 @@ async function startPolling() {
 
         if (msg.context_token) {
           latestContextToken = msg.context_token;
+          newTokens.push({ token: msg.context_token, at: Number(msg.create_time_ms) || Date.now() });
         }
         // 对方最近一次发消息的时间：微信只允许机器人在这之后约 24 小时内主动发消息，调度器据此提醒对方回一句
         latestUserMessageAt = Math.max(latestUserMessageAt, Number(msg.create_time_ms) || Date.now());
@@ -395,6 +398,7 @@ async function startPolling() {
         const stateUpdates = { recent_message_ids: [...seenIds].slice(-500) };
         if (data.get_updates_buf) stateUpdates.get_updates_buf = data.get_updates_buf;
         if (latestContextToken) stateUpdates.last_context_token = latestContextToken;
+        if (newTokens.length) stateUpdates.recent_context_tokens = mergeRecentTokens(loadRuntimeState('forwarder').recent_context_tokens, newTokens);
         if (latestUserMessageAt) stateUpdates.last_user_message_at = latestUserMessageAt;
         saveRuntimeState('forwarder', stateUpdates);
       }

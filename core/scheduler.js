@@ -105,16 +105,22 @@ function checkReplyWindow() {
   }
 }
 
+// 走到这里时，最近 24 小时每条消息的回复凭证都已经试过、全被拒了（发送函数会自动换着试）。
+// 对方最近 20 小时内还发过消息却全被拒：不是"太久没发消息"，是这些凭证都用满了（每个只能用 8~10 次）
+export const QUOTA_USED_UP_MARK = '回复凭证都用满了';
 function markReplyWindowClosed() {
   if (replyWindow().closed_at) return;
   const last = lastUserMessageAt();
   saveRuntimeState('reply_window', { closed_at: Date.now(), closed_user_at: last || null });
   const nick = safeConfig().user_nickname || '用户';
+  const hours = last ? (Date.now() - last) / 3600_000 : null;
   const since = last
-    ? `最后一次收到${nick}的消息是 ${shortTime(last)}（${Math.round((Date.now() - last) / 3600_000)} 小时前）`
+    ? `最后一次收到${nick}的消息是 ${shortTime(last)}（${Math.round(hours)} 小时前）`
     : `没有记录到${nick}最近一次发消息的时间`;
-  console.warn(`[微信窗口已关闭] ${since}；主动消息先暂停，等${nick}回消息`);
-  raiseAlert('user_window_closed', `${since}；微信拒绝了主动发送（prepare failed）`);
+  const usedUp = hours !== null && hours < 20;
+  const why = usedUp ? `最近这些消息的${QUOTA_USED_UP_MARK}（每条消息的凭证只能用 8~10 次）` : '超过一天没收到消息';
+  console.warn(`[微信窗口已关闭] ${since}；${why}；主动消息先暂停，等${nick}回消息`);
+  raiseAlert('user_window_closed', `${since}；${usedUp ? `${QUOTA_USED_UP_MARK}，` : ''}微信拒绝了主动发送（prepare failed）`);
 }
 
 // 早间播报因为微信窗口关着没送达：记下来，对方当天回消息就补发一次。
