@@ -296,8 +296,44 @@ const durationLabel = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` 
 // 到时间上限被停掉：如实说，不说成"中断了、换个问法"
 const timeoutNotice = (userNickname) => `${userNickname}，这个任务做了 ${durationLabel(AGENT_TIMEOUT_MS)}还没做完，按时间上限停掉了。停之前可能已经改了一部分文件、做了一部分事；要接着做，跟我说"接着做完"就行，也可以把任务拆小一点再发。`;
 
+// 回复标签：每次运行智能体给它一个专属文件（环境变量 CLAWBOT_REPLY_TAGS），工具在里面写一行标签
+// （比如 clawbot-cap 调用了 GPT 就写 GPT）；发回复时按标签在开头加【GPT】，没有标签就不加。
+// 一次运行一个文件，所以忙时并行的临时会话不会串标；读完就删
+const REPLY_TAGS_DIR = path.join(botRoot, 'data', 'state', 'reply-tags');
+function newReplyTagsFile() {
+  try { fs.mkdirSync(REPLY_TAGS_DIR, { recursive: true }); } catch {}
+  return path.join(REPLY_TAGS_DIR, `${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+}
+function peekReplyTags(file) {
+  try {
+    const tags = [];
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const tag = line.trim();
+      if (/^[A-Za-z0-9一-龥_-]{1,12}$/.test(tag) && !tags.includes(tag)) tags.push(tag);
+    }
+    return tags.slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+function takeReplyTags(file) {
+  const tags = peekReplyTags(file);
+  try { fs.unlinkSync(file); } catch {}
+  return tags;
+}
+const withReplyTags = (tags, text) => (tags && tags.length ? `${tags.map((t) => `【${t}】`).join('')}${text}` : text);
+// 上次异常退出留下的标签文件（超过一天的）清掉
+try {
+  for (const f of fs.readdirSync(REPLY_TAGS_DIR)) {
+    const p = path.join(REPLY_TAGS_DIR, f);
+    if (Date.now() - fs.statSync(p).mtimeMs > 86400_000) fs.unlinkSync(p);
+  }
+} catch {}
+
 // freshPrompt：原会话接不上、改开新会话重试时用的提示词（带最近几条回复的全文）；不给就用原来的
-function runAgent(promptText, conversationId = null, freshPrompt = null) {
+// tagsFile：这次运行的回复标签文件（不给就新建一个）
+function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFile = null) {
+  const tagsPath = tagsFile || newReplyTagsFile();
   return new Promise((resolve, reject) => {
     const args = ['--dangerously-skip-permissions'];
     if (conversationId) {
@@ -314,11 +350,12 @@ function runAgent(promptText, conversationId = null, freshPrompt = null) {
       {
         cwd: botRoot,
         timeout: AGENT_TIMEOUT_MS,
-        env: process.env,
+        env: { ...process.env, CLAWBOT_REPLY_TAGS: tagsPath },
         maxBuffer: 20 * 1024 * 1024,
       },
       (error, stdout, stderr) => {
         activeAgents--;
+        const tags = takeReplyTags(tagsPath);
         // 退出码为 0 但输出里 status 是 ERROR 的也算失败（比如登录失效）；没有 result 事件也算失败
         const outcome = agyOutcome(error, stdout, stderr);
         if (!outcome.ok) {
@@ -326,8 +363,8 @@ function runAgent(promptText, conversationId = null, freshPrompt = null) {
           if (conversationId && outcome.kind === 'error') {
             console.warn(`[agy] 会话 ${conversationId} 恢复失败，自动创建全新会话重试...`);
             // 标记 resumeFailed，回复里会告诉用户"原来的会话没接上"
-            return runAgent(freshPrompt || promptText, null)
-              .then((res) => resolve({ ...res, resumeFailed: true }))
+            return runAgent(freshPrompt || promptText, null, null, tagsPath)
+              .then((res) => resolve({ ...res, resumeFailed: true, tags: [...new Set([...tags, ...(res.tags || [])])] }))
               .catch(reject);
           }
           recordAgentResult('routine', outcome);
@@ -338,6 +375,7 @@ function runAgent(promptText, conversationId = null, freshPrompt = null) {
           console.error(`[agy exec error]: code=${error?.code ?? '-'} signal=${error?.signal ?? '-'} ${detail}`);
           const err = new Error(`Agent processing failed: ${detail}`);
           err.agentFailure = outcome.kind;
+          err.tags = tags;
           return reject(err);
         }
 
@@ -345,7 +383,7 @@ function runAgent(promptText, conversationId = null, freshPrompt = null) {
         if (outcome.warning) console.warn(`[agy 提示] 有回复，但带着提示（照常使用回复）：${outcome.warning}`);
         const usage = outcome.json.usage;
         if (usage) console.log(`[agy 用量]: 输入 ${usage.input_tokens ?? '?'} tokens，输出 ${usage.output_tokens ?? '?'} tokens`);
-        resolve({ reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId, contextTokens: agyContextTokens(stdout) });
+        resolve({ reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId, contextTokens: agyContextTokens(stdout), tags });
       }
     );
     // 提示词从标准输入交过去；agy 提前退出时写入会报 EPIPE，忽略即可（结果由上面的回调处理）
@@ -420,6 +458,9 @@ const MAX_ACTIVE_AGENTS = 2;
 // 超过这个时间还没出结果，先回一句"转入后台"，任务继续在后台跑（环境变量仅供测试缩短）。
 // 原来是 35 秒：实测一条消息中位数就要 48 秒，七成消息都会先收到这句；改成 90 秒后大约一成多
 const SOFT_TIMEOUT_MS = Number(process.env.ROUTINE_SOFT_TIMEOUT_MS) || 90000;
+// 转入后台以后，每隔多久报一次"还在做"、最多报几次（环境变量用来测试和调整）
+const PROGRESS_PING_MS = Number(process.env.ROUTINE_PROGRESS_PING_MS) || 15 * 60_000;
+const PROGRESS_PING_MAX = process.env.ROUTINE_PROGRESS_PING_MAX !== undefined ? Number(process.env.ROUTINE_PROGRESS_PING_MAX) : 3;
 // 等结果期间每隔多久重发一次"正在输入"，免得对方以为没反应（环境变量仅供测试）
 const TYPING_REFRESH_MS = Number(process.env.ROUTINE_TYPING_REFRESH_MS) || 20000;
 // 主会话每天换一次：北京时间 03:30（凌晨整理完记忆）以后的第一条消息开新会话；会话库太大、或者上一次回复时会话已经超过
@@ -1094,7 +1135,8 @@ async function handleWechatTask(task) {
   const startedAt = Date.now();
 
   // 启动智能体执行（最长 AGENT_TIMEOUT_MS，默认 60 分钟）
-  const agentPromise = runAgent(fullMessage, currentConvId, freshMessage);
+  const replyTagsFile = newReplyTagsFile();
+  const agentPromise = runAgent(fullMessage, currentConvId, freshMessage, replyTagsFile);
   if (useSide) {
     // 临时会话这一条跑完（成没成都算），记下会话 ID 给这段时间后面的消息接着用
     const releaseSide = (res) => {
@@ -1157,6 +1199,7 @@ async function handleWechatTask(task) {
       plainReply = withConversationNotice(raceResult.res, plainReply);
     }
 
+    plainReply = withReplyTags(raceResult.res?.tags || raceResult.err?.tags, plainReply);
     console.log(`[Antigravity 回复]: ${describeText(plainReply)}`);
 
     if (from_user_id && context_token) {
@@ -1189,9 +1232,31 @@ async function handleWechatTask(task) {
       }
     }
 
+    // 转入后台以后定时报进度：每 PROGRESS_PING_MS 说一次"还在做"，最多 PROGRESS_PING_MAX 次；
+    // 这次运行已经用到 GPT 的话带上【GPT】。发不出去（比如微信窗口关了）就不再报
+    let pingsSent = 0;
+    const pingTimer = PROGRESS_PING_MAX > 0 ? setInterval(async () => {
+      if (pingsSent >= PROGRESS_PING_MAX) return clearInterval(pingTimer);
+      pingsSent++;
+      const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
+      const text = withReplyTags(peekReplyTags(replyTagsFile), `${userNickname}，还在做，已经 ${minutes} 分钟了，好了马上发你～`);
+      try {
+        await pushRateLimiter.acquirePermission();
+        const latestConfig = loadConfig();
+        await sendWechatReply(latestConfig.authorized_user_id || from_user_id, context_token || loadRuntimeState('forwarder').last_context_token, text, latestConfig);
+        appendLog(`[后台进度]: ${text}`);
+        console.log(`⏳ [已报进度 ${pingsSent}/${PROGRESS_PING_MAX}]: ${minutes} 分钟`);
+      } catch (e) {
+        console.warn('[后台进度没发出去，这个任务不再报进度]:', e.message);
+        clearInterval(pingTimer);
+      }
+    }, PROGRESS_PING_MS) : null;
+    const stopPings = () => { if (pingTimer) clearInterval(pingTimer); };
+
     // 后台继续监听执行结果，彻底释放当前消息队列 handleWechatTask，后续进线消息不再被阻塞！
     backgroundDone = agentPromise
       .then(async (agentRes) => {
+        stopPings();
         try {
           console.log(`\n🎉 [后台长任务执行成功]: ${taskLabel}`);
           const rawReply = agentRes.reply;
@@ -1204,7 +1269,7 @@ async function handleWechatTask(task) {
 
           // 【第 2 段消息】：终结结果推送，单任务一生仅发这最后一条，杜绝任何碎片骚扰
           const headerPrefix = `🔔 【后台任务完成通知】\n${userNickname}，您交办的长任务已全部处理完成：\n\n`;
-          const finalReply = headerPrefix + withConversationNotice(agentRes, rawReply);
+          const finalReply = withReplyTags(agentRes.tags, headerPrefix + withConversationNotice(agentRes, rawReply));
 
           await deliverResultToWechat(toUser, targetToken, finalReply, rawReply, true, message_text);
           console.log(`✅ [后台长任务结果已成功推送至微信 (第 2 条消息)]\n`);
@@ -1215,6 +1280,7 @@ async function handleWechatTask(task) {
         }
       })
       .catch(async (execErr) => {
+        stopPings();
         try {
           console.error(`❌ [后台长任务执行异常]: ${taskLabel}`, execErr.message);
           const latestConfig = loadConfig();
@@ -1226,7 +1292,7 @@ async function handleWechatTask(task) {
             : execErr.agentFailure === 'timeout'
               ? `🔔 【后台任务执行提醒】\n${timeoutNotice(userNickname)}`
               : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`;
-          await deliverResultToWechat(toUser, targetToken, errorNotice, '', true, message_text);
+          await deliverResultToWechat(toUser, targetToken, withReplyTags(execErr.tags, errorNotice), '', true, message_text);
         } catch (postErr) {
           console.error(`[后台异常通知发送失败]:`, postErr.message);
         } finally {
