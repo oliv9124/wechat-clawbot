@@ -357,7 +357,7 @@ function codexSkillsIndex() {
       lines.push(`- ${name}：${desc}（说明书 ${path.relative(botRoot, md)}）`);
     }
   } catch {}
-  return lines.length ? `\n[可用技能：要用哪个，先读它的说明书，再照着做]\n${lines.join('\n')}\n` : '';
+  return (lines.length ? `\n[可用技能：要用哪个，先读它的说明书，再照着做]\n${lines.join('\n')}\n` : '') + CODEX_WORK_NOTE;
 }
 // Codex 每轮结束给的用量是整个会话的累计数（每次请求都把整段会话重新算一遍），不是会话现在多大。
 // 会话现在多大看它自己的会话记录 CODEX_HOME/sessions/年/月/日/rollout-…-<会话ID>.jsonl 里最后一次 token_count；找不到返回 0（只按天换会话）
@@ -395,9 +395,39 @@ function codexContextTokens(threadId) {
   console.warn(`[Codex] 没找到会话 ${threadId} 的用量记录，这次不按大小换会话`);
   return 0;
 }
+// GPT 这一轮画的图：它自带的生图工具固定存在 CODEX_HOME/generated_images/<会话ID>/（不在机器人目录里，系统发不出去），
+// clawbot-cap 画的在 data/cap/images/。回复里没带图时，取这一轮最新的一张复制到机器人自己的 data/gpt-images/（刚复制的文件才会被发送）
+const CODEX_IMAGE_RE = /\.(png|jpe?g|webp|gif)$/i;
+function codexTurnImage(threadId, sinceMs) {
+  const found = [];
+  const scan = (dir) => {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    for (const n of names) {
+      if (!CODEX_IMAGE_RE.test(n)) continue;
+      const p = path.join(dir, n);
+      try {
+        const st = fs.statSync(p);
+        if (st.isFile() && st.mtimeMs >= sinceMs) found.push({ p, t: st.mtimeMs });
+      } catch {}
+    }
+  };
+  if (threadId) scan(path.join(CODEX_HOME_DIR, 'generated_images', threadId));
+  scan(path.join(botRoot, 'data', 'cap', 'images'));
+  if (!found.length) return null;
+  const latest = found.sort((a, b) => a.t - b.t).pop().p;
+  const dir = path.join(botRoot, 'data', 'gpt-images');
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date(Date.now() + 8 * 3600_000).toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const dest = path.join(dir, `${stamp}-${crypto.randomBytes(2).toString('hex')}${path.extname(latest).toLowerCase()}`);
+  fs.copyFileSync(latest, dest);
+  return dest;
+}
+const CODEX_WORK_NOTE = '\n[干活提示] clawbot-cap 这类命令要跑几十秒到几分钟：等它跑完、看到输出再决定下一步，没跑完就接着等，不要当成失败另想办法。用你自带的生图工具画的图，系统会自动发给主人，回复里不用写路径。\n';
 function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
   try { fs.appendFileSync(tagsPath, 'GPT\n'); } catch {}
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     const args = ['exec', ...(threadId ? ['resume'] : []), '--json', '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox', ...(threadId ? [threadId] : []), '-'];
@@ -440,9 +470,22 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
         err.tags = tags;
         return reject(err);
       }
+      // 回复里没带图、这一轮却画了图（GPT 自带工具的图存在它自己的目录，系统发不出去）：取最新一张放进机器人目录，自动发
+      let finalReply = reply;
+      try {
+        if (!extractMediaPaths(reply).images.length) {
+          const img = codexTurnImage(thread, startedAt);
+          if (img) {
+            finalReply = `${reply}\nfile://${img}`;
+            console.log(`[GPT 画的图] 回复里没带，自动补发：${describePath(img)}`);
+          }
+        }
+      } catch (e) {
+        console.warn(`[GPT 画的图] 没能补发：${e.message}`);
+      }
       const context = codexContextTokens(thread);
       if (usage) console.log(`[Codex 用量]: 会话累计输入 ${usage.input_tokens ?? '?'}（其中缓存 ${usage.cached_input_tokens ?? '?'}），输出 ${usage.output_tokens ?? '?'}；会话现在约 ${context} tokens`);
-      resolve({ reply, conversationId: thread, contextTokens: context, tags, brain: 'codex' });
+      resolve({ reply: finalReply, conversationId: thread, contextTokens: context, tags, brain: 'codex' });
     });
     child.stdin.on('error', () => {});
     child.stdin.end(promptText);
@@ -1360,7 +1403,7 @@ async function handleWechatTask(task) {
     }
 
     plainReply = withReplyTags(raceResult.res?.tags || raceResult.err?.tags, plainReply);
-    console.log(`[Antigravity 回复]: ${describeText(plainReply)}`);
+    console.log(`[${brain === 'codex' ? 'GPT' : 'Antigravity'} 回复]: ${describeText(plainReply)}`);
 
     if (from_user_id && context_token) {
       await deliverResultToWechat(from_user_id, context_token, plainReply, rawReply, false, message_text);
