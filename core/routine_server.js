@@ -330,6 +330,125 @@ try {
   }
 } catch {}
 
+// ---------- GPT 大脑（Codex CLI） ----------
+// config.json 里 codex_brain:true 的机器人可以把消息交给 Codex：「用 GPT …」只这一条，「切到 GPT」之后都用，「切回来」换回 Antigravity。
+// Codex 用这个机器人自己的登录（CLAWBOT_CODEX_HOME，一个机器人一份，不复制别人的）；会话 ID 和 Antigravity 的分开记（运行状态 codex）。
+const CODEX_EXE = process.env.CLAWBOT_CODEX_EXE || '/opt/codex-mcp/runtime/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex';
+const CODEX_HOME_DIR = process.env.CLAWBOT_CODEX_HOME || path.join(process.env.HOME || botRoot, '.codex');
+// GPT 会话现在多大（最近一次请求的输入 token）超过这个数就开新会话；另外和 Antigravity 一样，过了凌晨整理记忆的时间也开新会话
+const CODEX_ROTATE_TOKENS = Number(process.env.ROUTINE_CODEX_ROTATE_TOKENS) || 80000;
+function parseBrainCommand(text) {
+  const t = String(text || '').trim();
+  if (/^(切到|切换到|换成|改用)\s*(gpt|codex)(\s*模式)?[。.!！]?$/i.test(t)) return { kind: 'on' };
+  if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?)[。.!！]?$/i.test(t)) return { kind: 'off' };
+  if (/^用\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
+  return null;
+}
+// 技能清单写进给 Codex 的提示词（它不会自己去 .agents/skills 里找）
+function codexSkillsIndex() {
+  const dir = path.join(botRoot, '.agents', 'skills');
+  const lines = [];
+  try {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const md = path.join(dir, name, 'SKILL.md');
+      let text = '';
+      try { text = fs.readFileSync(md, 'utf8'); } catch { continue; }
+      const desc = ((text.match(/^description:\s*(.+)$/m) || [])[1] || '').trim().slice(0, 120);
+      lines.push(`- ${name}：${desc}（说明书 ${path.relative(botRoot, md)}）`);
+    }
+  } catch {}
+  return lines.length ? `\n[可用技能：要用哪个，先读它的说明书，再照着做]\n${lines.join('\n')}\n` : '';
+}
+// Codex 每轮结束给的用量是整个会话的累计数（每次请求都把整段会话重新算一遍），不是会话现在多大。
+// 会话现在多大看它自己的会话记录 CODEX_HOME/sessions/年/月/日/rollout-…-<会话ID>.jsonl 里最后一次 token_count；找不到返回 0（只按天换会话）
+function codexContextTokens(threadId) {
+  if (!threadId) return 0;
+  const ls = (p) => { try { return fs.readdirSync(p).sort(); } catch { return []; } };
+  const base = path.join(CODEX_HOME_DIR, 'sessions');
+  const dirs = [];
+  for (const y of ls(base).slice(-2)) {
+    for (const m of ls(path.join(base, y)).slice(-2)) {
+      for (const d of ls(path.join(base, y, m)).slice(-3)) dirs.push(path.join(base, y, m, d));
+    }
+  }
+  for (const dir of dirs.reverse()) {
+    const name = ls(dir).find((n) => n.endsWith(`-${threadId}.jsonl`));
+    if (!name) continue;
+    try {
+      const file = path.join(dir, name);
+      const size = fs.statSync(file).size;
+      const len = Math.min(size, 1024 * 1024);
+      const buf = Buffer.alloc(len);
+      const fd = fs.openSync(file, 'r');
+      try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
+      const lines = buf.toString('utf8').split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i].includes('"token_count"')) continue;
+        try {
+          const u = JSON.parse(lines[i]).payload?.info?.last_token_usage;
+          if (u && Number.isFinite(u.input_tokens)) return u.input_tokens + (Number(u.output_tokens) || 0);
+        } catch {}
+      }
+    } catch {}
+    break;
+  }
+  console.warn(`[Codex] 没找到会话 ${threadId} 的用量记录，这次不按大小换会话`);
+  return 0;
+}
+function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
+  const tagsPath = tagsFile || newReplyTagsFile();
+  try { fs.appendFileSync(tagsPath, 'GPT\n'); } catch {}
+  return new Promise((resolve, reject) => {
+    const args = ['exec', ...(threadId ? ['resume'] : []), '--json', '--skip-git-repo-check',
+      '--dangerously-bypass-approvals-and-sandbox', ...(threadId ? [threadId] : []), '-'];
+    console.log(`[调用 Codex]: 会话ID=${threadId || '(全新会话)'}`);
+    activeAgents++;
+    const child = execFile(CODEX_EXE, args, {
+      cwd: botRoot,
+      timeout: AGENT_TIMEOUT_MS,
+      env: { ...process.env, CODEX_HOME: CODEX_HOME_DIR, CLAWBOT_REPLY_TAGS: tagsPath },
+      maxBuffer: 50 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      activeAgents--;
+      const tags = takeReplyTags(tagsPath);
+      let thread = threadId;
+      const texts = [];
+      let usage = null;
+      let failure = '';
+      for (const line of String(stdout || '').split('\n')) {
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'thread.started' && ev.thread_id) thread = ev.thread_id;
+        else if (ev.type === 'item.completed' && ev.item?.type === 'agent_message' && ev.item.text) texts.push(ev.item.text);
+        else if (ev.type === 'turn.completed') usage = ev.usage || null;
+        else if (ev.type === 'turn.failed' || ev.type === 'error') failure = String(ev.error?.message || ev.message || 'Codex 出错');
+      }
+      // 只发最后一条（前面几条是"我先核对一下"这类干活前的过程话）
+      const reply = String(texts[texts.length - 1] || '').trim();
+      if (error || failure || !reply) {
+        const tail = String(stderr || '').trim().slice(-300);
+        const kind = error?.killed ? 'timeout' : /log ?in|401|unauthori[sz]ed|refresh.?token/i.test(`${tail} ${failure}`) ? 'auth' : 'error';
+        if (threadId && kind === 'error') {
+          console.warn(`[Codex] 会话 ${threadId} 接不上，开新会话重试`);
+          return runCodex(freshPrompt || promptText, null, null, tagsPath)
+            .then((res) => resolve({ ...res, resumeFailed: true, tags: [...new Set([...tags, ...(res.tags || [])])] }))
+            .catch(reject);
+        }
+        console.error(`[Codex exec error]: ${kind} ${failure || tail || `exit ${error?.code ?? '-'}`}`);
+        const err = new Error(`Codex processing failed: ${failure || tail || 'no reply'}`);
+        err.agentFailure = kind;
+        err.tags = tags;
+        return reject(err);
+      }
+      const context = codexContextTokens(thread);
+      if (usage) console.log(`[Codex 用量]: 会话累计输入 ${usage.input_tokens ?? '?'}（其中缓存 ${usage.cached_input_tokens ?? '?'}），输出 ${usage.output_tokens ?? '?'}；会话现在约 ${context} tokens`);
+      resolve({ reply, conversationId: thread, contextTokens: context, tags, brain: 'codex' });
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(promptText);
+  });
+}
+
 // freshPrompt：原会话接不上、改开新会话重试时用的提示词（带最近几条回复的全文）；不给就用原来的
 // tagsFile：这次运行的回复标签文件（不给就新建一个）
 function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFile = null) {
@@ -1077,12 +1196,29 @@ async function handleWechatTask(task) {
   }
 
   // 1. 发送输入中状态
+  // GPT 大脑：「切到 GPT」「切回来」程序直接切；「用 GPT …」只这一条交给 Codex（只有 config.json 开了 codex_brain 的机器人认）
+  let brain = 'agy';
+  if (config.codex_brain) {
+    const cmd = parseBrainCommand(message_text);
+    if (cmd?.kind === 'on' || cmd?.kind === 'off') {
+      saveRuntimeState('brain', { mode: cmd.kind === 'on' ? 'codex' : 'agy', changed_at: Date.now() });
+      const reply = cmd.kind === 'on' ? '好，接下来用 GPT 回答（说「切回来」换回）。' : '好，换回来了，接下来用默认的大脑回答。';
+      appendLog(`微信接收 (${from_user_id}): ${message_text}`);
+      appendLog(`AI回复(实时): ${reply}`);
+      console.log(`[切换大脑] ${cmd.kind === 'on' ? 'GPT（Codex）' : 'Antigravity'}`);
+      if (context_token) await sendWechatReply(from_user_id, context_token, reply, config);
+      console.log(`====================================================\n`);
+      return null;
+    }
+    if (cmd?.kind === 'once' || loadRuntimeState('brain').mode === 'codex') brain = 'codex';
+  }
+
   if (from_user_id && context_token) {
     await sendWechatTyping(from_user_id, context_token, 1, config);
   }
 
   // 2. 调用 Antigravity 生成回复（带多轮会话记忆、长期记忆库与最近对话滑窗护栏）
-  console.log(`[Antigravity 思考中...]`);
+  console.log(brain === 'codex' ? '[GPT 思考中...]' : '[Antigravity 思考中...]');
   // 会话占用锁：主会话空闲就用主会话；正被转入后台的任务占着时，改用临时会话，结果也不回写主会话 ID
   const useMainConversation = !mainConversationBusy;
   const generation = mainConversationGeneration;
@@ -1101,10 +1237,25 @@ async function handleWechatTask(task) {
       ? '[会话占用] 主会话正被后台任务使用，本条消息接着用这段时间的临时会话。'
       : '[会话占用] 主会话正被后台任务使用，本条消息开临时会话处理（这段时间后面的消息接着用它）。');
   }
-  const rotateReason = useMainConversation ? conversationRotationReason(routineState, currentConvId) : null;
+  const rotateReason = useMainConversation && brain !== 'codex' ? conversationRotationReason(routineState, currentConvId) : null;
   if (rotateReason) {
     console.log(`[会话轮换] ${rotateReason}，这条消息开新会话（最近的聊天和长期记忆照常带上）。`);
     currentConvId = null;
+  }
+  // GPT 大脑：会话 ID 单独记（运行状态 codex）；忙时的临时消息每次开新会话（最近的聊天照常带上），不和 Antigravity 混用会话。
+  // 和 Antigravity 一样：过了凌晨整理记忆的时间、或者会话太大，就开新会话
+  let codexState = {};
+  if (brain === 'codex') {
+    codexState = useMainConversation ? loadRuntimeState('codex') : {};
+    currentConvId = useMainConversation ? codexState.conversation_id || null : null;
+    const codexTokens = Number(codexState.conversation_tokens) || 0;
+    const codexRotate = !currentConvId ? null
+      : (Number(codexState.conversation_started_at) || 0) < lastRotationBoundary() ? '已经过了凌晨整理记忆的时间'
+        : codexTokens > CODEX_ROTATE_TOKENS ? `GPT 会话已经有 ${(codexTokens / 10000).toFixed(1)} 万 token` : null;
+    if (codexRotate) {
+      console.log(`[会话轮换] ${codexRotate}，这条消息开新的 GPT 会话（最近的聊天和长期记忆照常带上）。`);
+      currentConvId = null;
+    }
   }
   const rememberConversation = (res) => {
     if (!useMainConversation) return;
@@ -1116,9 +1267,11 @@ async function handleWechatTask(task) {
     if (res.conversationId && res.conversationId !== currentConvId) Object.assign(patch, { conversation_id: res.conversationId, conversation_started_at: Date.now() });
     // 记下会话现在多大，下一条消息据此决定要不要换新会话
     if (Number.isFinite(res.contextTokens)) patch.conversation_tokens = res.contextTokens;
+    // GPT：记下这次会话里已经有的记忆，下一条记忆没变就不重复发
+    if (res.brain === 'codex') patch.memory_hash = memoryHash;
     if (!Object.keys(patch).length) return;
-    saveRuntimeState('routine', patch);
-    if (patch.conversation_id) console.log(`[已持久化会话记忆 ID]: ${res.conversationId}`);
+    saveRuntimeState(res.brain === 'codex' ? 'codex' : 'routine', patch);
+    if (patch.conversation_id) console.log(`[已持久化${res.brain === 'codex' ? ' GPT' : ''}会话记忆 ID]: ${res.conversationId}`);
   };
   const withConversationNotice = (res, text) => (res.resumeFailed ? `${text}\n\n${CONVERSATION_LOST_NOTICE}` : text);
   const memorySection = loadBotMemory(message_text);
@@ -1127,8 +1280,15 @@ async function handleWechatTask(task) {
   const recentChatSection = currentConvId ? getRecentChatContext(5) : freshRecent;
   const promptHead = `[系统备注：当前微信对话用户为【${userNickname}】，助手身份为${personaDesc}。在所有回复中直接称呼用户为“${userNickname}”。${forbiddenPrompt}严禁修改全局AGENTS.md。若用户要求记住什么，按规则第 8 节记：每次聊天都用得上的写进 MEMORY.md（不超过 ${MEMORY_MAX_CHARS} 字），某个领域的结论写进 data/memory/topics/ 对应专题（每本不超过 ${TOPIC_MAX_CHARS} 字），资料原文放 data/memory/library/；同一件事改原来那一条，不要另加一条。]${memorySection}`;
   const promptTail = `\n[微信用户 ${userNickname}]: ${message_text}`;
-  const fullMessage = `${promptHead}${recentChatSection}${promptTail}`;
-  const freshMessage = `${promptHead}${freshRecent}${promptTail}`;
+  // GPT：开新会话时带技能清单；接着原会话聊时不再重复发整份记忆（会话里已经有了），记忆变了才再带一次；身份提醒和最近的聊天照常带
+  const codexSkills = brain === 'codex' ? codexSkillsIndex() : '';
+  const memoryHash = crypto.createHash('sha1').update(memorySection).digest('hex').slice(0, 16);
+  const codexResume = brain === 'codex' && Boolean(currentConvId);
+  const memoryChanged = codexResume && codexState.memory_hash !== memoryHash;
+  const codexResumeHead = `[系统备注：接着上面的对话。微信用户仍是【${userNickname}】，你的身份仍是${personaDesc}，直接称呼用户为“${userNickname}”。${forbiddenPrompt}要记东西照规则第 8 节记。]${memoryChanged ? `\n[记忆有更新，以下面这份为准]${memorySection}` : ''}`;
+  const fullMessage = codexResume ? `${codexResumeHead}${recentChatSection}${promptTail}` : `${promptHead}${codexSkills}${recentChatSection}${promptTail}`;
+  const freshMessage = `${promptHead}${codexSkills}${freshRecent}${promptTail}`;
+  if (codexResume) console.log(`[GPT 接着聊] 记忆${memoryChanged ? '有更新，这次带上' : '没变，不重复发'}（这条提示词 ${[...fullMessage].length} 字）`);
 
   // 标记活跃后台任务
   activeBackgroundTasks.add(taskKey);
@@ -1136,13 +1296,13 @@ async function handleWechatTask(task) {
 
   // 启动智能体执行（最长 AGENT_TIMEOUT_MS，默认 60 分钟）
   const replyTagsFile = newReplyTagsFile();
-  const agentPromise = runAgent(fullMessage, currentConvId, freshMessage, replyTagsFile);
+  const agentPromise = (brain === 'codex' ? runCodex : runAgent)(fullMessage, currentConvId, freshMessage, replyTagsFile);
   if (useSide) {
     // 临时会话这一条跑完（成没成都算），记下会话 ID 给这段时间后面的消息接着用
     const releaseSide = (res) => {
       if (sideConversation.epoch !== sideEpoch || sideConversation.generation !== generation) return;
       sideConversation.running = false;
-      if (res?.conversationId) sideConversation.id = res.conversationId;
+      if (res?.conversationId && res.brain !== 'codex') sideConversation.id = res.conversationId;
     };
     agentPromise.then(releaseSide, () => releaseSide(null));
   }
