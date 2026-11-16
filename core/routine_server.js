@@ -436,6 +436,71 @@ const CODEX_WORK_NOTE = `
 4. 写文章、写代码、做文档、写网页都自己直接做。做 PDF 照 documents 技能，发布网站照 website 技能。
 5. 主人让你做新东西，就这次新做一份；文件夹里已有的文件（可能是默认大脑刚做的）不能当成你这次做好的。只有主人要"再发一次"以前的东西，才发旧文件。
 `;
+// ---------- 漏写路径时补发（两个大脑都管） ----------
+// 系统只发回复里写了完整路径的文件。模型有时只写文件名（"red_heart.jpg"），或者画了图却没写，这里按"这一轮新生成的文件"补上。
+const MENTION_RE = /([^\s/\\`'"<>()（）【】「」《》：:，,；;]+\.(?:png|jpe?g|webp|gif|pdf|docx?|xlsx?|pptx?|csv|txt|zip|mp3|m4a|wav|mp4|mov|m4v))/gi;
+const MENTION_SKIP_DIRS = new Set(['.venv', 'node_modules', '.git', '.agents', 'state', 'history', 'downloads', 'memory', 'inbox', 'alerts', 'reply-tags']);
+function findTurnFilesByName(names, sinceMs) {
+  const found = new Map();
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!MENTION_SKIP_DIRS.has(e.name)) walk(p, depth + 1); continue; }
+      if (!e.isFile() || !names.has(e.name)) continue;
+      try {
+        const t = fs.statSync(p).mtimeMs;
+        if (t >= sinceMs && (!found.has(e.name) || found.get(e.name).t < t)) found.set(e.name, { p, t });
+      } catch {}
+    }
+  };
+  walk(botRoot, 0);
+  return [...found.values()].map((x) => x.p);
+}
+// Antigravity 这一轮画的图：自带工具存在 $HOME/.gemini/antigravity-cli/brain/<会话>/<名字>_<13位时间>.<扩展名>，技能让它再复制进 data/images/
+function agyTurnImages(conversationId, sinceMs) {
+  const out = [];
+  const scan = (dir, re) => {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    for (const n of names) {
+      if (!re.test(n)) continue;
+      const p = path.join(dir, n);
+      try { const st = fs.statSync(p); if (st.isFile() && st.mtimeMs >= sinceMs) out.push({ p, t: st.mtimeMs }); } catch {}
+    }
+  };
+  if (conversationId) scan(path.join(process.env.HOME || '', '.gemini', 'antigravity-cli', 'brain', String(conversationId)), /_\d{13}\.(png|jpe?g|webp)$/i);
+  scan(path.join(botRoot, 'data', 'images'), CODEX_IMAGE_RE);
+  return out;
+}
+function attachTurnMedia(reply, sinceMs, drawnImages = []) {
+  const text = String(reply || '');
+  const have = extractMediaPaths(text);
+  const haveAll = new Set([...have.images, ...have.files, ...have.videos]);
+  const add = [];
+  const names = new Set();
+  for (const m of text.matchAll(MENTION_RE)) {
+    if (m.index > 0 && /[\/\\]/.test(text[m.index - 1])) continue;  // 前面带路径的，系统自己认得
+    names.add(m[1]);
+  }
+  if (names.size) for (const p of findTurnFilesByName(names, sinceMs)) if (!haveAll.has(p)) add.push(p);
+  if (!have.images.length && !add.some((p) => CODEX_IMAGE_RE.test(p)) && drawnImages.length) {
+    const latest = drawnImages.sort((a, b) => a.t - b.t).pop().p;
+    if (latest.startsWith(botRoot + path.sep)) add.push(latest);
+    else {
+      const dir = path.join(botRoot, 'data', 'images');
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, path.basename(latest).replace(/_\d{13}(\.[a-z]+)$/i, '$1'));
+      fs.copyFileSync(latest, dest);
+      add.push(dest);
+    }
+  }
+  if (!add.length) return text;
+  console.log(`[补发] 回复里没写完整路径，系统补上：${add.map((p) => describePath(p)).join('、')}`);
+  return `${text}\n${add.map((p) => `file://${p}`).join('\n')}`;
+}
 function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
   try { fs.appendFileSync(tagsPath, 'GPT\n'); } catch {}
@@ -495,6 +560,7 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
       } catch (e) {
         console.warn(`[GPT 画的图] 没能补发：${e.message}`);
       }
+      try { finalReply = attachTurnMedia(finalReply, startedAt); } catch (e) { console.warn(`[补发] 没能补发：${e.message}`); }
       const context = codexContextTokens(thread);
       if (usage) console.log(`[Codex 用量]: 会话累计输入 ${usage.input_tokens ?? '?'}（其中缓存 ${usage.cached_input_tokens ?? '?'}），输出 ${usage.output_tokens ?? '?'}；会话现在约 ${context} tokens`);
       resolve({ reply: finalReply, conversationId: thread, contextTokens: context, tags, brain: 'codex' });
@@ -508,6 +574,7 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
 // tagsFile：这次运行的回复标签文件（不给就新建一个）
 function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     const args = ['--dangerously-skip-permissions'];
     if (conversationId) {
@@ -557,7 +624,10 @@ function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFil
         if (outcome.warning) console.warn(`[agy 提示] 有回复，但带着提示（照常使用回复）：${outcome.warning}`);
         const usage = outcome.json.usage;
         if (usage) console.log(`[agy 用量]: 输入 ${usage.input_tokens ?? '?'} tokens，输出 ${usage.output_tokens ?? '?'} tokens`);
-        resolve({ reply: outcome.json.response || '', conversationId: outcome.json.conversation_id || conversationId, contextTokens: agyContextTokens(stdout), tags });
+        const agyConv = outcome.json.conversation_id || conversationId;
+        let agyReply = outcome.json.response || '';
+        try { agyReply = attachTurnMedia(agyReply, startedAt, agyTurnImages(agyConv, startedAt)); } catch (e) { console.warn(`[补发] 没能补发：${e.message}`); }
+        resolve({ reply: agyReply, conversationId: agyConv, contextTokens: agyContextTokens(stdout), tags });
       }
     );
     // 提示词从标准输入交过去；agy 提前退出时写入会报 EPIPE，忽略即可（结果由上面的回调处理）
