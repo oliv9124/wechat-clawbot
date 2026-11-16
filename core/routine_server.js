@@ -341,7 +341,7 @@ function parseBrainCommand(text) {
   const t = String(text || '').trim();
   if (/^(切到|切换到|换成|改用)\s*(gpt|codex)(\s*模式)?[。.!！]?$/i.test(t)) return { kind: 'on' };
   if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?)[。.!！]?$/i.test(t)) return { kind: 'off' };
-  if (/^用\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
+  if (/^(用|让|请|叫)?\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
   return null;
 }
 // 技能清单写进给 Codex 的提示词（它不会自己去 .agents/skills 里找）
@@ -350,6 +350,7 @@ function codexSkillsIndex() {
   const lines = [];
   try {
     for (const name of fs.readdirSync(dir).sort()) {
+      if (name === 'codex-work') continue; // GPT 自己就是 GPT，不用再把活转给共享服务里的另一个
       const md = path.join(dir, name, 'SKILL.md');
       let text = '';
       try { text = fs.readFileSync(md, 'utf8'); } catch { continue; }
@@ -428,6 +429,8 @@ const CODEX_WORK_NOTE = `
 1. 新画的图直接用你自带的生图工具，画好后系统会自动发给主人，回复里不用写路径。只有要在主人发来的照片上改图时，才用 clawbot-cap image。
 2. clawbot-cap 这类命令要跑几十秒到几分钟：等它跑完、看到输出再决定下一步，没跑完就接着等，不要当成失败另想办法。
 3. 做好的文件（Word、PDF、表格、视频等）放在你的文件夹里，回复里单独一行写 file:// 加完整路径，系统才会发给主人，比如 file://${botRoot}/data/周报.docx
+4. 你自己就是 GPT：写文章、写代码、做文档自己直接做，不要再交给 clawbot-cap 里的另一个 GPT（又慢又费额度）。做网站、在主人发来的照片上改图，照技能说明书用 clawbot-cap。
+5. 主人让你做新东西，就这次新做一份；文件夹里已有的文件（可能是默认大脑刚做的）不能当成你这次做好的。只有主人要"再发一次"以前的东西，才发旧文件。
 `;
 function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
