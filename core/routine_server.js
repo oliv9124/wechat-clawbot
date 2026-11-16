@@ -429,7 +429,7 @@ const CODEX_WORK_NOTE = `
 1. 新画的图直接用你自带的生图工具，画好后系统会自动发给主人，回复里不用写路径。只有要在主人发来的照片上改图时，才用 clawbot-cap image。
 2. clawbot-cap 这类命令要跑几十秒到几分钟：等它跑完、看到输出再决定下一步，没跑完就接着等，不要当成失败另想办法。
 3. 做好的文件（Word、PDF、表格、视频等）放在你的文件夹里，回复里单独一行写 file:// 加完整路径，系统才会发给主人，比如 file://${botRoot}/data/周报.docx
-4. 你自己就是 GPT：写文章、写代码、做文档自己直接做，不要再交给 clawbot-cap 里的另一个 GPT（又慢又费额度）。做网站、在主人发来的照片上改图，照技能说明书用 clawbot-cap。
+4. 你自己就是 GPT：写文章、写代码、做文档自己直接做，不要用 clawbot-cap task 交给另一个 GPT（又慢又费额度）。要做 PDF 或把网页变成图片：网页（.html）自己写好，用 clawbot-cap project-new <项目名> 建个项目（已有就不用建），clawbot-cap put <项目名> <页面.html> <本地网页文件> 放进去，再 clawbot-cap render <项目名> <页面.html> --pdf 转换（不加 --pdf 就是图片），把返回的 file:// 行写进回复。做网站、在主人发来的照片上改图，照技能说明书用 clawbot-cap。
 5. 主人让你做新东西，就这次新做一份；文件夹里已有的文件（可能是默认大脑刚做的）不能当成你这次做好的。只有主人要"再发一次"以前的东西，才发旧文件。
 `;
 function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
