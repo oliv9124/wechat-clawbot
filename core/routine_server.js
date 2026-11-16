@@ -338,10 +338,14 @@ const CODEX_HOME_DIR = process.env.CLAWBOT_CODEX_HOME || path.join(process.env.H
 // GPT 会话现在多大（最近一次请求的输入 token）超过这个数就开新会话；另外和 Antigravity 一样，过了凌晨整理记忆的时间也开新会话
 const CODEX_ROTATE_TOKENS = Number(process.env.ROUTINE_CODEX_ROTATE_TOKENS) || 80000;
 function parseBrainCommand(text) {
-  const t = String(text || '').trim();
-  if (/^(切到|切换到|换成|改用)\s*(gpt|codex)(\s*模式)?[。.!！]?$/i.test(t)) return { kind: 'on' };
-  if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?)[。.!！]?$/i.test(t)) return { kind: 'off' };
-  if (/^(用|让|请|叫)?\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
+  const raw = String(text || '').trim();
+  // 命令前面先叫一声名字也认：「小助，切到 GPT」「阿福 用 GPT 写首诗」（去掉开头 6 个字以内的称呼和后面的逗号、冒号或空格再判断）
+  const named = raw.replace(/^[@＠]?[^\s，,：:。.!！?？]{1,6}[，,：:\s]+/, '');
+  for (const t of named === raw ? [raw] : [raw, named]) {
+    if (/^(切到|切换到|换成|改用)\s*(gpt|codex)(\s*模式)?[。.!！]?$/i.test(t)) return { kind: 'on' };
+    if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?)[。.!！]?$/i.test(t)) return { kind: 'off' };
+    if (/^(用|让|请|叫)?\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
+  }
   return null;
 }
 // 技能清单写进给 Codex 的提示词（它不会自己去 .agents/skills 里找）
