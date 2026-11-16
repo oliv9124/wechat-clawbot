@@ -40,6 +40,7 @@ import {
 import { memoryMode, useStandaloneHistory, parseMemoryCommand, findBotByName, showChanges, undoItems } from './memory_history.js';
 import { parseCredentialCommand, saveSkillCredential, credentialHelp, isInstalled } from './skills.js';
 import { raiseAlert } from './alert.js';
+import { cleanupOldSessions, referencedIds, describeCleanup } from './session_cleanup.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, agyContextTokens, recordAgentResult } from './agent_health.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -335,8 +336,11 @@ try {
 // Codex 用这个机器人自己的登录（CLAWBOT_CODEX_HOME，一个机器人一份，不复制别人的）；会话 ID 和 Antigravity 的分开记（运行状态 codex）。
 const CODEX_EXE = process.env.CLAWBOT_CODEX_EXE || '/opt/codex-mcp/runtime/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex';
 const CODEX_HOME_DIR = process.env.CLAWBOT_CODEX_HOME || path.join(process.env.HOME || botRoot, '.codex');
-// GPT 会话现在多大（最近一次请求的输入 token）超过这个数就开新会话；另外和 Antigravity 一样，过了凌晨整理记忆的时间也开新会话
-const CODEX_ROTATE_TOKENS = Number(process.env.ROUTINE_CODEX_ROTATE_TOKENS) || 80000;
+// GPT 会话现在多大（最近一次请求的输入 token）超过这个数就开新会话；另外和 Antigravity 一样，过了凌晨整理记忆的时间也开新会话。
+// 原来 8 万：会话越大，每一步都要把整段会话重发一遍，越用越贵，改成 6 万
+const CODEX_ROTATE_TOKENS = Number(process.env.ROUTINE_CODEX_ROTATE_TOKENS) || 60000;
+// GPT 会话隔这么久没用，下一条消息开新会话：缓存早过期了，接着用旧会话每一步都按原价重发整段历史；新会话照样带最近的聊天和长期记忆
+const CODEX_IDLE_ROTATE_MS = (Number(process.env.ROUTINE_CODEX_IDLE_ROTATE_MINUTES) || 120) * 60_000;
 function parseBrainCommand(text) {
   const raw = String(text || '').trim();
   // 命令前面先叫一声名字也认：「小助，切到 GPT」「阿福 用 GPT 写首诗」（去掉开头 6 个字以内的称呼和后面的逗号、冒号或空格再判断）
@@ -344,6 +348,7 @@ function parseBrainCommand(text) {
   for (const t of named === raw ? [raw] : [raw, named]) {
     if (/^(切到|切换到|换成|改用)\s*(gpt|codex)(\s*模式)?[。.!！]?$/i.test(t)) return { kind: 'on' };
     if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?)[。.!！]?$/i.test(t)) return { kind: 'off' };
+    if (/^(查(一下|下)?|看(一下|下)?)?\s*gpt\s*的?\s*(额度|用量|余量|配额)(还剩多少|还有多少|剩多少|怎么样|多少)?[？?。.!！]?$/i.test(t)) return { kind: 'quota' };
     if (/^(用|让|请|叫)?\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
   }
   return null;
@@ -365,9 +370,11 @@ function codexSkillsIndex() {
   return (lines.length ? `\n[可用技能：要用哪个，先读它的说明书，再照着做]\n${lines.join('\n')}\n` : '') + CODEX_WORK_NOTE;
 }
 // Codex 每轮结束给的用量是整个会话的累计数（每次请求都把整段会话重新算一遍），不是会话现在多大。
-// 会话现在多大看它自己的会话记录 CODEX_HOME/sessions/年/月/日/rollout-…-<会话ID>.jsonl 里最后一次 token_count；找不到返回 0（只按天换会话）
-function codexContextTokens(threadId) {
-  if (!threadId) return 0;
+// 会话现在多大看它自己的会话记录 CODEX_HOME/sessions/年/月/日/rollout-…-<会话ID>.jsonl 里最后一次 token_count；找不到算 0（只按天换会话）。
+// 同一种 token_count 里还有账号的额度（rate_limits），一起取出来
+function codexTokenInfo(threadId) {
+  const out = { context: 0, rateLimits: null };
+  if (!threadId) return out;
   const ls = (p) => { try { return fs.readdirSync(p).sort(); } catch { return []; } };
   const base = path.join(CODEX_HOME_DIR, 'sessions');
   const dirs = [];
@@ -387,18 +394,24 @@ function codexContextTokens(threadId) {
       const fd = fs.openSync(file, 'r');
       try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
       const lines = buf.toString('utf8').split('\n');
-      for (let i = lines.length - 1; i >= 0; i--) {
+      for (let i = lines.length - 1; i >= 0 && !(out.context && out.rateLimits); i--) {
         if (!lines[i].includes('"token_count"')) continue;
         try {
-          const u = JSON.parse(lines[i]).payload?.info?.last_token_usage;
-          if (u && Number.isFinite(u.input_tokens)) return u.input_tokens + (Number(u.output_tokens) || 0);
+          const p = JSON.parse(lines[i]).payload || {};
+          const u = p.info?.last_token_usage;
+          if (!out.context && u && Number.isFinite(u.input_tokens)) out.context = u.input_tokens + (Number(u.output_tokens) || 0);
+          if (!out.rateLimits && p.rate_limits && (p.rate_limits.primary || p.rate_limits.secondary)) out.rateLimits = p.rate_limits;
         } catch {}
       }
     } catch {}
-    break;
+    if (!out.context) console.warn(`[Codex] 会话 ${threadId} 的记录里没有用量，这次不按大小换会话`);
+    return out;
   }
   console.warn(`[Codex] 没找到会话 ${threadId} 的用量记录，这次不按大小换会话`);
-  return 0;
+  return out;
+}
+function codexContextTokens(threadId) {
+  return codexTokenInfo(threadId).context;
 }
 // GPT 这一轮画的图：它自带的生图工具固定存在 CODEX_HOME/generated_images/<会话ID>/（不在机器人目录里，系统发不出去），
 // clawbot-cap 画的在 data/cap/images/。回复里没带图时，取这一轮最新的一张复制到机器人自己的 data/gpt-images/（刚复制的文件才会被发送）
@@ -501,6 +514,89 @@ function attachTurnMedia(reply, sinceMs, drawnImages = []) {
   console.log(`[补发] 回复里没写完整路径，系统补上：${add.map((p) => describePath(p)).join('、')}`);
   return `${text}\n${add.map((p) => `file://${p}`).join('\n')}`;
 }
+// ---------- GPT 额度 ----------
+// Codex 每次请求后在会话记录里写下账号的额度：primary 是 5 小时窗口，secondary 是每周窗口（used_percent 已用百分比，resets_at 重置时间，秒）。
+// 每轮 GPT 结束记进运行状态 codex_quota（问「GPT 额度」直接回这个数，不调用 GPT）。本周用到 70%、90% 各在回复末尾提醒主人一次，
+// 5 小时窗口用到 90% 提醒一次；本周用到 80% 告诉管理员一次（用同一个账号的几个机器人谁先看到谁报，监控整台服务器只发一次）。
+// 额度用完：这条改用默认大脑回答，GPT 模式也切回去，告诉主人什么时候恢复
+// 提醒的几档（环境变量可以改，测试用）
+const QUOTA_WEEK_WARN = String(process.env.ROUTINE_QUOTA_WEEK_WARN || '70,90').split(',').map(Number).filter((n) => n > 0).sort((a, b) => a - b);
+const QUOTA_5H_WARN = Number(process.env.ROUTINE_QUOTA_5H_WARN) || 90;
+const QUOTA_ADMIN_WARN = Number(process.env.ROUTINE_QUOTA_ADMIN_WARN) || 80;
+const CODEX_QUOTA_ERROR = /usage.?limit|hit your (usage )?limit|rate.?limit|too many requests|\b429\b|quota/i;
+const quotaPct = (w) => Math.round(Number(w?.used_percent) || 0);
+// 北京时间：今天 14:30 / 明天 08:00 / 11月20日 08:00（sec 是秒）
+function bjWhen(sec) {
+  const ms = Number(sec) * 1000;
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const d = new Date(ms + 8 * 3600_000);
+  const t = new Date(Date.now() + 8 * 3600_000);
+  const hm = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+  const days = Math.round((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate())) / 86400_000);
+  return days === 0 ? `今天 ${hm}` : days === 1 ? `明天 ${hm}` : `${d.getUTCMonth() + 1}月${d.getUTCDate()}日 ${hm}`;
+}
+// 记下这一轮看到的额度；该提醒主人时返回一句提醒（加在回复末尾），不用提醒返回空串
+function noteCodexQuota(limits) {
+  if (!limits || (!limits.primary && !limits.secondary)) return '';
+  const prev = loadRuntimeState('codex_quota');
+  const week = limits.secondary || null;
+  const h5 = limits.primary || null;
+  // 还是同一周、同一个 5 小时窗口：重置时间差不多（每次报的可能差几秒）
+  const sameWeek = week && Math.abs(Number(week.resets_at) - Number(prev.week_resets_at || 0)) < 6 * 3600;
+  const same5h = h5 && Math.abs(Number(h5.resets_at) - Number(prev.h5_resets_at || 0)) < 600;
+  let weekWarned = sameWeek ? Number(prev.week_warned) || 0 : 0;
+  let adminWarned = sameWeek ? Boolean(prev.week_admin_warned) : false;
+  let h5Warned = same5h ? Boolean(prev.h5_warned) : false;
+  const notes = [];
+  const wp = quotaPct(week);
+  const level = week ? [...QUOTA_WEEK_WARN].reverse().find((l) => wp >= l) || 0 : 0;
+  if (level > weekWarned) {
+    notes.push(level >= QUOTA_WEEK_WARN[QUOTA_WEEK_WARN.length - 1]
+      ? `GPT 本周额度已经用了 ${wp}%，快用完了，${bjWhen(week.resets_at)} 重置；用完会自动换回默认大脑`
+      : `GPT 本周额度已经用了 ${wp}%，${bjWhen(week.resets_at)} 重置，省着点用`);
+    weekWarned = level;
+  }
+  const hp = quotaPct(h5);
+  if (h5 && hp >= QUOTA_5H_WARN && !h5Warned) {
+    if (!notes.length) notes.push(`GPT 这 5 小时的额度已经用了 ${hp}%，${bjWhen(h5.resets_at)} 恢复`);
+    h5Warned = true;
+  }
+  if (week && wp >= QUOTA_ADMIN_WARN && !adminWarned) {
+    raiseAlert('gpt_quota', `GPT 本周额度已用 ${wp}%，${bjWhen(week.resets_at)} 重置`);
+    adminWarned = true;
+  }
+  saveRuntimeState('codex_quota', {
+    primary: h5, secondary: week, plan_type: limits.plan_type || null, reached: limits.rate_limit_reached_type || null, at: Date.now(),
+    week_resets_at: week ? Number(week.resets_at) : prev.week_resets_at ?? null, week_warned: weekWarned, week_admin_warned: adminWarned,
+    h5_resets_at: h5 ? Number(h5.resets_at) : prev.h5_resets_at ?? null, h5_warned: h5Warned,
+  });
+  return notes.length ? `（提醒：${notes.join('；')}。）` : '';
+}
+// 记下的额度显示某个窗口已经用满、还没到重置时间：返回那个窗口（不用再去调 GPT）
+function codexQuotaExhausted() {
+  const q = loadRuntimeState('codex_quota');
+  const nowSec = Date.now() / 1000;
+  return [q.secondary, q.primary].find((w) => w && quotaPct(w) >= 100 && Number(w.resets_at) > nowSec) || null;
+}
+// 「GPT 额度」：回上次用 GPT 时记下的数
+function codexQuotaReport(mode) {
+  const q = loadRuntimeState('codex_quota');
+  const brainNow = mode === 'codex' ? '现在用的是 GPT。' : '现在用的是默认大脑。';
+  if (!q.at || (!q.primary && !q.secondary)) return `还没记下 GPT 的额度（用过一次 GPT 以后再问就有了）。${brainNow}`;
+  const mins = Math.round((Date.now() - q.at) / 60000);
+  const ago = mins < 1 ? '刚才' : mins < 60 ? `${mins} 分钟前` : mins < 48 * 60 ? `${Math.round(mins / 60)} 小时前` : `${Math.round(mins / 1440)} 天前`;
+  const nowSec = Date.now() / 1000;
+  const line = (w, name, verb) => (Number(w.resets_at) <= nowSec
+    ? `${name}的额度 ${bjWhen(w.resets_at)} 已经${verb}过了（之前用了 ${quotaPct(w)}%）`
+    : `${name}已用 ${quotaPct(w)}%，${bjWhen(w.resets_at)} ${verb}`);
+  const lines = [`GPT 额度（${ago}用 GPT 时看到的）：`];
+  if (q.secondary) lines.push(line(q.secondary, '本周', '重置'));
+  if (q.primary) lines.push(line(q.primary, '这 5 小时', '恢复'));
+  lines.push(brainNow);
+  return lines.join('\n');
+}
+// 正在跑的 GPT 任务数（GPT 长时间不用自动切回时，有任务在跑就不切）
+let codexBusy = 0;
 function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
   try { fs.appendFileSync(tagsPath, 'GPT\n'); } catch {}
@@ -534,7 +630,11 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
       const reply = String(texts[texts.length - 1] || '').trim();
       if (error || failure || !reply) {
         const tail = String(stderr || '').trim().slice(-300);
-        const kind = error?.killed ? 'timeout' : /log ?in|401|unauthori[sz]ed|refresh.?token/i.test(`${tail} ${failure}`) ? 'auth' : 'error';
+        const kind = error?.killed ? 'timeout'
+          : /log ?in|401|unauthori[sz]ed|refresh.?token/i.test(`${tail} ${failure}`) ? 'auth'
+            : CODEX_QUOTA_ERROR.test(`${tail} ${failure}`) ? 'quota' : 'error';
+        // 额度用完：记下这时的额度（之后几条不用再去调 GPT）
+        if (kind === 'quota') { try { noteCodexQuota(codexTokenInfo(thread).rateLimits); } catch {} }
         if (threadId && kind === 'error') {
           console.warn(`[Codex] 会话 ${threadId} 接不上，开新会话重试`);
           return runCodex(freshPrompt || promptText, null, null, tagsPath)
@@ -561,9 +661,13 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
         console.warn(`[GPT 画的图] 没能补发：${e.message}`);
       }
       try { finalReply = attachTurnMedia(finalReply, startedAt); } catch (e) { console.warn(`[补发] 没能补发：${e.message}`); }
-      const context = codexContextTokens(thread);
+      const info = codexTokenInfo(thread);
+      const context = info.context;
       if (usage) console.log(`[Codex 用量]: 会话累计输入 ${usage.input_tokens ?? '?'}（其中缓存 ${usage.cached_input_tokens ?? '?'}），输出 ${usage.output_tokens ?? '?'}；会话现在约 ${context} tokens`);
-      resolve({ reply: finalReply, conversationId: thread, contextTokens: context, tags, brain: 'codex' });
+      let notice = '';
+      try { notice = noteCodexQuota(info.rateLimits); } catch (e) { console.warn(`[GPT 额度] 没记下：${e.message}`); }
+      if (info.rateLimits) console.log(`[GPT 额度] 本周已用 ${quotaPct(info.rateLimits.secondary)}%，这 5 小时已用 ${quotaPct(info.rateLimits.primary)}%${notice ? '（这次提醒主人）' : ''}`);
+      resolve({ reply: finalReply, conversationId: thread, contextTokens: context, tags, brain: 'codex', notice });
     });
     child.stdin.on('error', () => {});
     child.stdin.end(promptText);
@@ -1196,7 +1300,7 @@ async function handleWechatTask(task) {
   appendLog(`微信接收 (${from_user_id}): ${message_text}`);
 
   // 快捷重置会话指令判断
-  const isResetCommand = /^\s*(\/reset|\/clear|\/new|新会话|重置会话|清除记忆)\s*$/i.test(message_text);
+  const isResetCommand = RESET_COMMAND.test(message_text);
   if (isResetCommand) {
     mainConversationGeneration++;
     // 后台占用期间的临时会话也一起丢掉：重置以后的消息不再接着它
@@ -1214,7 +1318,7 @@ async function handleWechatTask(task) {
   }
 
   // 微信一键升级已关闭：代码更新改在服务器上进行（git + systemctl restart），这里只回一句说明
-  const isUpgradeCommand = /^\s*(\/upgrade|\/update|更新系统|系统更新|升级系统|检查更新|更新机器人|升级机器人|机器人更新)\s*$/i.test(message_text);
+  const isUpgradeCommand = UPGRADE_COMMAND.test(message_text);
   if (isUpgradeCommand) {
     const upgradeNotice = '⚙️ 微信里的一键升级已经关闭。需要更新时，请在服务器上更新代码后重启服务。';
     if (from_user_id && context_token) {
@@ -1325,17 +1429,29 @@ async function handleWechatTask(task) {
   let brain = 'agy';
   if (config.codex_brain) {
     const cmd = parseBrainCommand(message_text);
-    if (cmd?.kind === 'on' || cmd?.kind === 'off') {
-      saveRuntimeState('brain', { mode: cmd.kind === 'on' ? 'codex' : 'agy', changed_at: Date.now() });
-      const reply = cmd.kind === 'on' ? '好，接下来用 GPT 回答（说「切回来」换回）。' : '好，换回来了，接下来用默认的大脑回答。';
-      appendLog(`微信接收 (${from_user_id}): ${message_text}`);
+    if (cmd?.kind === 'on' || cmd?.kind === 'off' || cmd?.kind === 'quota') {
+      // （「微信接收」前面已经记过了，这里只记回复）
+      let reply;
+      const empty = cmd.kind === 'on' ? codexQuotaExhausted() : null;
+      if (cmd.kind === 'quota') {
+        reply = codexQuotaReport(loadRuntimeState('brain').mode);
+        console.log('[GPT 额度] 直接回记下的额度，不调用 GPT');
+      } else if (empty) {
+        reply = `GPT 的额度用完了，${bjWhen(empty.resets_at)} 恢复，先接着用默认的大脑。`;
+        console.log('[切换大脑] GPT 额度用完了，没切');
+      } else {
+        const now = Date.now();
+        saveRuntimeState('brain', cmd.kind === 'on' ? { mode: 'codex', changed_at: now, last_used_at: now } : { mode: 'agy', changed_at: now });
+        reply = cmd.kind === 'on' ? '好，接下来用 GPT 回答（说「切回来」换回）。' : '好，换回来了，接下来用默认的大脑回答。';
+        console.log(`[切换大脑] ${cmd.kind === 'on' ? 'GPT（Codex）' : 'Antigravity'}`);
+      }
       appendLog(`AI回复(实时): ${reply}`);
-      console.log(`[切换大脑] ${cmd.kind === 'on' ? 'GPT（Codex）' : 'Antigravity'}`);
       if (context_token) await sendWechatReply(from_user_id, context_token, reply, config);
       console.log(`====================================================\n`);
       return null;
     }
-    if (cmd?.kind === 'once' || loadRuntimeState('brain').mode === 'codex') brain = 'codex';
+    const parts = Array.isArray(task.parts) && task.parts.length ? task.parts : [message_text];
+    if (parts.some((p) => parseBrainCommand(p)?.kind === 'once') || loadRuntimeState('brain').mode === 'codex') brain = 'codex';
   }
 
   if (from_user_id && context_token) {
@@ -1374,9 +1490,11 @@ async function handleWechatTask(task) {
     codexState = useMainConversation ? loadRuntimeState('codex') : {};
     currentConvId = useMainConversation ? codexState.conversation_id || null : null;
     const codexTokens = Number(codexState.conversation_tokens) || 0;
+    const codexIdle = Date.now() - (Number(codexState.last_used_at) || Number(codexState.conversation_started_at) || Date.now());
     const codexRotate = !currentConvId ? null
       : (Number(codexState.conversation_started_at) || 0) < lastRotationBoundary() ? '已经过了凌晨整理记忆的时间'
-        : codexTokens > CODEX_ROTATE_TOKENS ? `GPT 会话已经有 ${(codexTokens / 10000).toFixed(1)} 万 token` : null;
+        : codexTokens > CODEX_ROTATE_TOKENS ? `GPT 会话已经有 ${(codexTokens / 10000).toFixed(1)} 万 token`
+          : codexIdle > CODEX_IDLE_ROTATE_MS ? `GPT 会话已经 ${(codexIdle / 3600_000).toFixed(1)} 小时没用了` : null;
     if (codexRotate) {
       console.log(`[会话轮换] ${codexRotate}，这条消息开新的 GPT 会话（最近的聊天和长期记忆照常带上）。`);
       currentConvId = null;
@@ -1389,11 +1507,13 @@ async function handleWechatTask(task) {
       return;
     }
     const patch = {};
-    if (res.conversationId && res.conversationId !== currentConvId) Object.assign(patch, { conversation_id: res.conversationId, conversation_started_at: Date.now() });
+    // 和这次用的那个会话比（GPT 额度用完、改用默认大脑时是默认大脑的会话）
+    const baseConv = res.previousConversationId !== undefined ? res.previousConversationId : currentConvId;
+    if (res.conversationId && res.conversationId !== baseConv) Object.assign(patch, { conversation_id: res.conversationId, conversation_started_at: Date.now() });
     // 记下会话现在多大，下一条消息据此决定要不要换新会话
     if (Number.isFinite(res.contextTokens)) patch.conversation_tokens = res.contextTokens;
-    // GPT：记下这次会话里已经有的记忆，下一条记忆没变就不重复发
-    if (res.brain === 'codex') patch.memory_hash = memoryHash;
+    // GPT：记下这次会话里已经有的记忆，下一条记忆没变就不重复发；记下最后一次用的时间（隔太久没用就开新会话）
+    if (res.brain === 'codex') Object.assign(patch, { memory_hash: memoryHash, last_used_at: Date.now() });
     if (!Object.keys(patch).length) return;
     saveRuntimeState(res.brain === 'codex' ? 'codex' : 'routine', patch);
     if (patch.conversation_id) console.log(`[已持久化${res.brain === 'codex' ? ' GPT' : ''}会话记忆 ID]: ${res.conversationId}`);
@@ -1421,7 +1541,40 @@ async function handleWechatTask(task) {
 
   // 启动智能体执行（最长 AGENT_TIMEOUT_MS，默认 60 分钟）
   const replyTagsFile = newReplyTagsFile();
-  const agentPromise = (brain === 'codex' ? runCodex : runAgent)(fullMessage, currentConvId, freshMessage, replyTagsFile);
+  // GPT 额度用完（记下的额度显示用满了，或者这次调用被拒）：这条改用默认大脑回答，GPT 模式也切回去，回复末尾告诉主人什么时候恢复
+  const codexQuotaFallback = async (win) => {
+    const q = loadRuntimeState('codex_quota');
+    const w = win || [q.secondary, q.primary].find((x) => x && quotaPct(x) >= 100 && Number(x.resets_at) * 1000 > Date.now()) || null;
+    const when = w ? bjWhen(w.resets_at) : '';
+    const switched = loadRuntimeState('brain').mode === 'codex';
+    if (switched) saveRuntimeState('brain', { mode: 'agy', changed_at: Date.now(), quota_off_at: Date.now() });
+    console.log(`[GPT 额度用完] 这条改用 Antigravity${switched ? '，GPT 模式也切回去了' : ''}`);
+    const agyState = useMainConversation ? loadRuntimeState('routine') : {};
+    let agyConv = useMainConversation ? agyState.conversation_id || null : null;
+    if (agyConv && conversationRotationReason(agyState, agyConv)) agyConv = null;
+    // 不说明的话，Antigravity 看到「用 GPT …」可能会自己去找别的模型代答，或者把额度的事再说一遍
+    const note = '\n[系统备注：主人这条本来要交给 GPT，但 GPT 的额度用完了，这条由你直接回答；不要去找别的模型或 GPT 代答，也不用提额度的事（系统会在回复末尾说明）。]';
+    const res = await runAgent(`${promptHead}${agyConv ? getRecentChatContext(5) : freshRecent}${note}${promptTail}`, agyConv, `${promptHead}${freshRecent}${note}${promptTail}`, replyTagsFile);
+    return {
+      ...res,
+      previousConversationId: agyConv,
+      notice: `（GPT 额度用完了${when ? `，${when} 恢复` : ''}。这条先用默认大脑回答${switched ? '，也已经切回默认大脑' : ''}；${when ? '恢复以后' : '过一阵'}说「切到 GPT」再用。）`,
+    };
+  };
+  let agentPromise;
+  if (brain !== 'codex') {
+    agentPromise = runAgent(fullMessage, currentConvId, freshMessage, replyTagsFile);
+  } else if (codexQuotaExhausted()) {
+    agentPromise = codexQuotaFallback(codexQuotaExhausted());
+  } else {
+    codexBusy++;
+    agentPromise = runCodex(fullMessage, currentConvId, freshMessage, replyTagsFile)
+      .catch((err) => (err.agentFailure === 'quota' ? codexQuotaFallback(null) : Promise.reject(err)))
+      .finally(() => {
+        codexBusy--;
+        try { saveRuntimeState('brain', { last_used_at: Date.now() }); } catch {}
+      });
+  }
   if (useSide) {
     // 临时会话这一条跑完（成没成都算），记下会话 ID 给这段时间后面的消息接着用
     const releaseSide = (res) => {
@@ -1485,6 +1638,7 @@ async function handleWechatTask(task) {
     }
 
     plainReply = withReplyTags(raceResult.res?.tags || raceResult.err?.tags, plainReply);
+    if (raceResult.res?.notice) plainReply = `${plainReply.trimEnd()}\n\n${raceResult.res.notice}`;
     console.log(`[${brain === 'codex' ? 'GPT' : 'Antigravity'} 回复]: ${describeText(plainReply)}`);
 
     if (from_user_id && context_token) {
@@ -1554,7 +1708,8 @@ async function handleWechatTask(task) {
 
           // 【第 2 段消息】：终结结果推送，单任务一生仅发这最后一条，杜绝任何碎片骚扰
           const headerPrefix = `🔔 【后台任务完成通知】\n${userNickname}，您交办的长任务已全部处理完成：\n\n`;
-          const finalReply = withReplyTags(agentRes.tags, headerPrefix + withConversationNotice(agentRes, rawReply));
+          let finalReply = withReplyTags(agentRes.tags, headerPrefix + withConversationNotice(agentRes, rawReply));
+          if (agentRes.notice) finalReply = `${finalReply.trimEnd()}\n\n${agentRes.notice}`;
 
           await deliverResultToWechat(toUser, targetToken, finalReply, rawReply, true, message_text);
           console.log(`✅ [后台长任务结果已成功推送至微信 (第 2 条消息)]\n`);
@@ -1623,8 +1778,98 @@ function isQuickStatusMessage(fileName) {
   }
 }
 
+// ---------- 连着发的几条消息合成一条处理 ----------
+// 主人常常一口气发好几条（先发图再说要干什么、一句话拆成几条发）。以前一条一条处理：第一条还没看到后面的就回了，后面的又各回一遍。
+// 现在收到普通消息先等一小会儿（马上显示"正在输入"）：文字等 2 秒；只有图片或文件、还没说要干什么的，最多等 8 秒看后面有没有话。
+// 这期间又来了就从最新那条重新算（最多等 20 秒）；等到了，或者智能体在忙、消息排了队，就把排在最前面、连着的普通消息合成一条交给大脑，只回一次。
+// 程序直接处理的指令（切到 GPT、切回来、GPT 额度、重置会话、设置凭证、记忆改动；有任务在后台时问进度）不等、不合并，按顺序单独处理
+const MERGE_TEXT_WAIT_MS = Number(process.env.ROUTINE_MERGE_TEXT_WAIT_MS ?? 2000);
+const MERGE_MEDIA_WAIT_MS = Number(process.env.ROUTINE_MERGE_MEDIA_WAIT_MS ?? 8000);
+const MERGE_MAX_WAIT_MS = 20_000;
+const MERGE_MAX_MESSAGES = 10;
+const RESET_COMMAND = /^\s*(\/reset|\/clear|\/new|新会话|重置会话|清除记忆)\s*$/i;
+const UPGRADE_COMMAND = /^\s*(\/upgrade|\/update|更新系统|系统更新|升级系统|检查更新|更新机器人|升级机器人|机器人更新)\s*$/i;
+// forwarder 收到只有图片的消息时写成这样（见 wechat_forwarder.js）
+const IMAGE_ONLY_PREFIX = '请查看并详细分析用户在微信发送的这张图片: ';
+function isInstantMessage(text) {
+  const t = String(text || '').trim();
+  if (RESET_COMMAND.test(t) || UPGRADE_COMMAND.test(t)) return true;
+  if (STATUS_QUESTION.test(t) && (backgroundTasks.size > 0 || pushRateLimiter.isCoolingDown() > 0)) return true;
+  const cmd = parseBrainCommand(t);
+  if (cmd && cmd.kind !== 'once') return true;
+  try {
+    if (parseCredentialCommand(t) || parseMemoryCommand(t)) return true;
+  } catch {}
+  return false;
+}
+// 只有图片或文件、没说要干什么
+function isMediaOnly(text) {
+  const t = String(text || '');
+  return t.startsWith(IMAGE_ONLY_PREFIX) || t.replace(/\[已接收用户在微信发送的文件: [^\n]*\]/g, '').trim() === '';
+}
+function peekPending(fileName) {
+  const p = path.join(dataDir, 'inbox', 'pending', fileName);
+  try {
+    return { fileName, at: fs.statSync(p).mtimeMs, task: JSON.parse(fs.readFileSync(p, 'utf-8')) };
+  } catch {
+    return null;
+  }
+}
+// 排在最前面的一批：指令单独一条、不等；普通消息连着取（最多 10 条），算出还要等多久
+function pickBatch(pending) {
+  const first = peekPending(pending[0]);
+  if (!first || isInstantMessage(first.task.message_text)) return { files: [pending[0]], waitMs: 0 };
+  const group = [first];
+  for (const f of pending.slice(1, MERGE_MAX_MESSAGES)) {
+    const item = peekPending(f);
+    if (!item || item.task.from_user_id !== first.task.from_user_id || isInstantMessage(item.task.message_text)) break;
+    group.push(item);
+  }
+  const newest = group.reduce((a, b) => (b.at >= a.at ? b : a));
+  const oldest = Math.min(...group.map((g) => g.at));
+  const wait = group.every((g) => isMediaOnly(g.task.message_text)) ? MERGE_MEDIA_WAIT_MS : MERGE_TEXT_WAIT_MS;
+  const waitMs = group.length >= MERGE_MAX_MESSAGES ? 0 : Math.max(0, Math.min(newest.at + wait, oldest + MERGE_MAX_WAIT_MS) - Date.now());
+  return { files: group.map((g) => g.fileName), waitMs, newest };
+}
+// 合成一条：按顺序编号，用最新那条的回复凭证；parts 留着原文（「用 GPT …」是哪一条说的都认）
+function mergeTasks(tasks, nickname) {
+  if (tasks.length === 1) return tasks[0];
+  const last = tasks[tasks.length - 1];
+  const parts = tasks.map((t) => String(t.message_text || ''));
+  const lines = parts.map((p, i) => {
+    const t = p.trim();
+    return `${i + 1}. ${t.startsWith(IMAGE_ONLY_PREFIX) ? `[已接收用户发送的图片文件: ${t.slice(IMAGE_ONLY_PREFIX.length)}]` : t}`;
+  });
+  return {
+    ...last,
+    context_token: [...tasks].reverse().map((t) => t.context_token).find(Boolean) || last.context_token,
+    message_text: `[${nickname}连着发了 ${tasks.length} 条消息，按顺序如下。请把它们当成一件事一起看，只回复一次]\n${lines.join('\n')}`,
+    parts,
+    merged_ids: tasks.map((t) => t.message_id),
+  };
+}
+// 等的时候：先显示"正在输入"（每来一条新消息发一次），到点再处理
+const typingShownFor = new Set();
+let pumpWakeTimer = null;
+function waitForBatch(batch) {
+  const { fileName, task } = batch.newest;
+  if (!typingShownFor.has(fileName)) {
+    typingShownFor.add(fileName);
+    if (typingShownFor.size > 100) typingShownFor.delete(typingShownFor.values().next().value);
+    console.log(`[合并等待] 收到消息，先显示"正在输入"，${(batch.waitMs / 1000).toFixed(1)} 秒内没有新消息就开始处理`);
+    try {
+      if (task.from_user_id && task.context_token) sendWechatTyping(task.from_user_id, task.context_token, 1, loadConfig(), { quiet: true }).catch(() => {});
+    } catch {}
+  }
+  if (pumpWakeTimer) clearTimeout(pumpWakeTimer);
+  pumpWakeTimer = setTimeout(() => {
+    pumpWakeTimer = null;
+    pumpInbox().catch((e) => console.error('[收件箱处理异常]:', e));
+  }, batch.waitMs + 20);
+}
+
 /**
- * 按时间顺序从收件箱取消息处理。同时运行的智能体达到上限时先不取（问进度的除外），等有空位再继续。
+ * 按时间顺序从收件箱取消息处理（连着发的普通消息合成一条，见上）。同时运行的智能体达到上限时先不取（问进度的除外），等有空位再继续。
  * 处理完（含后台任务结束）才记为已处理并删除文件；中途崩溃的消息会在下次启动时重新处理。
  */
 async function pumpInbox() {
@@ -1634,35 +1879,60 @@ async function pumpInbox() {
   try {
     for (;;) {
       const pending = listPending().filter((f) => !skipped.has(f) && !inFlightMessageIds.has(messageIdFromFileName(f)));
-      const fileName = activeAgents < MAX_ACTIVE_AGENTS ? pending[0] : pending.find(isQuickStatusMessage);
-      if (!fileName) break;
-      const messageId = messageIdFromFileName(fileName);
-
-      let claimedPath = null;
-      let task;
-      try {
-        claimedPath = claimInbox(fileName);
-        task = JSON.parse(fs.readFileSync(claimedPath, 'utf-8'));
-      } catch (err) {
-        console.error(`[收件箱] 无法读取 ${fileName}，移到 failed/:`, err.message);
-        skipped.add(fileName);
-        try { failInbox(fileName, claimedPath ? 'processing' : 'pending'); } catch {}
-        raiseAlert('message_failed', `收件箱里有一条消息文件读不出来（${fileName}），已移到 failed/`);
-        continue;
+      if (!pending.length) break;
+      let files;
+      if (activeAgents < MAX_ACTIVE_AGENTS) {
+        const batch = pickBatch(pending);
+        if (batch.waitMs > 0) {
+          waitForBatch(batch);
+          break;
+        }
+        files = batch.files;
+      } else {
+        const quick = pending.find(isQuickStatusMessage);
+        if (!quick) break;
+        files = [quick];
       }
 
-      if (isHandled(messageId)) {
-        console.log(`[去重] 消息 ${messageId} 已经处理过，跳过。`);
-        finishInbox(claimedPath);
-        continue;
+      const claimed = [];
+      for (const fileName of files) {
+        const messageId = messageIdFromFileName(fileName);
+        let claimedPath = null;
+        let task;
+        try {
+          claimedPath = claimInbox(fileName);
+          task = JSON.parse(fs.readFileSync(claimedPath, 'utf-8'));
+        } catch (err) {
+          console.error(`[收件箱] 无法读取 ${fileName}，移到 failed/:`, err.message);
+          skipped.add(fileName);
+          try { failInbox(fileName, claimedPath ? 'processing' : 'pending'); } catch {}
+          raiseAlert('message_failed', `收件箱里有一条消息文件读不出来（${fileName}），已移到 failed/`);
+          continue;
+        }
+        if (isHandled(messageId)) {
+          console.log(`[去重] 消息 ${messageId} 已经处理过，跳过。`);
+          finishInbox(claimedPath);
+          continue;
+        }
+        claimed.push({ messageId, claimedPath, task });
       }
+      if (!claimed.length) continue;
 
-      inFlightMessageIds.add(messageId);
+      for (const c of claimed) inFlightMessageIds.add(c.messageId);
       const complete = () => {
-        rememberHandled(messageId);
-        finishInbox(claimedPath);
-        inFlightMessageIds.delete(messageId);
+        for (const c of claimed) {
+          rememberHandled(c.messageId);
+          finishInbox(c.claimedPath);
+          inFlightMessageIds.delete(c.messageId);
+        }
       };
+      let task = claimed[0].task;
+      if (claimed.length > 1) {
+        let nickname = '主人';
+        try { nickname = loadConfig().user_nickname || '主人'; } catch {}
+        task = mergeTasks(claimed.map((c) => c.task), nickname);
+        console.log(`[合并消息] ${claimed.length} 条连着发的消息合成一条处理`);
+      }
       try {
         const result = await handleWechatTask(task);
         if (result && result.background) {
@@ -1674,17 +1944,81 @@ async function pumpInbox() {
           complete();
         }
       } catch (err) {
-        inFlightMessageIds.delete(messageId);
-        const outcome = retryOrFailInbox(claimedPath, task);
-        console.error(`[收件箱] 处理消息 ${messageId} 出错（${outcome === 'retry' ? '稍后重试' : '已移到 failed/'}）:`, err.message);
-        if (outcome === 'failed') {
-          raiseAlert('message_failed', `一条消息处理 3 次都失败，已移到 failed/（${messageId}）：${err.message}`);
+        for (const c of claimed) {
+          inFlightMessageIds.delete(c.messageId);
+          const outcome = retryOrFailInbox(c.claimedPath, c.task);
+          console.error(`[收件箱] 处理消息 ${c.messageId} 出错（${outcome === 'retry' ? '稍后重试' : '已移到 failed/'}）:`, err.message);
+          if (outcome === 'failed') {
+            raiseAlert('message_failed', `一条消息处理 3 次都失败，已移到 failed/（${c.messageId}）：${err.message}`);
+          }
         }
       }
     }
   } finally {
     pumping = false;
   }
+}
+
+// ---------- GPT 长时间不用，自动切回默认大脑 ----------
+// 切到 GPT 以后超过 codex_idle_minutes 分钟（config.json，默认 30；0 = 不自动切）没再用 GPT，就切回默认大脑并告诉主人，省 GPT 额度。
+// 有 GPT 任务在跑、或者还有消息没处理完时不切
+async function checkCodexIdle() {
+  let config;
+  try { config = loadConfig(); } catch { return; }
+  if (!config.codex_brain) return;
+  const minutes = Number(config.codex_idle_minutes ?? process.env.ROUTINE_CODEX_IDLE_MINUTES ?? 30);
+  if (!(minutes > 0)) return;
+  const st = loadRuntimeState('brain');
+  if (st.mode !== 'codex') return;
+  if (codexBusy > 0 || inFlightMessageIds.size > 0 || listPending().length > 0) return;
+  const last = Math.max(Number(st.last_used_at) || 0, Number(st.changed_at) || 0);
+  if (Date.now() - last < minutes * 60_000) return;
+  saveRuntimeState('brain', { mode: 'agy', changed_at: Date.now(), auto_off_at: Date.now() });
+  const span = minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60} 小时` : `${minutes} 分钟`;
+  const text = `好一阵（${span}）没用 GPT 了，已经自动切回默认大脑，省点 GPT 额度。要接着用就说「切到 GPT」。`;
+  console.log(`[切换大脑] ${span}没用 GPT，自动切回 Antigravity`);
+  appendLog(`AI回复(系统): ${text}`);
+  const to = config.authorized_user_id;
+  const token = loadRuntimeState('forwarder').last_context_token;
+  if (!to || !token) return;
+  try {
+    await pushRateLimiter.acquirePermission();
+    await sendWechatReply(to, token, text, config);
+  } catch (err) {
+    console.warn('[切换大脑] 自动切回的提醒没发出去:', err.message);
+  }
+}
+
+// ---------- 每天清理一次旧会话（见 session_cleanup.js）----------
+// 北京时间 04:40 以后（凌晨 03:30 换完会话、整理完记忆；几个机器人错开最多 10 分钟）。超过 session_cleanup_days 天（config.json，默认 14；
+// 0 = 不清会话）没动过的会话、超过 media_cleanup_days 天（默认 30；0 = 不清）的画图删掉；正在用的会话不动
+const CLEANUP_AT_MINUTES = 280;
+function runSessionCleanup() {
+  let config = {};
+  try { config = loadConfig(); } catch {}
+  const r = cleanupOldSessions({
+    botRoot,
+    home: process.env.HOME || '',
+    // GPT 只清这个机器人自己的登录目录（服务里设了 CLAWBOT_CODEX_HOME 的），不碰别的 Codex
+    codexHome: config.codex_brain && process.env.CLAWBOT_CODEX_HOME ? CODEX_HOME_DIR : '',
+    keepIds: referencedIds(botRoot, [sideConversation.id]),
+    days: Number(config.session_cleanup_days ?? process.env.ROUTINE_SESSION_CLEANUP_DAYS ?? 14),
+    mediaDays: Number(config.media_cleanup_days ?? 30),
+    dryRun: process.env.ROUTINE_SESSION_CLEANUP_DRY_RUN === '1',
+  });
+  console.log(`[会话清理] ${describeCleanup(r)}`);
+  return r;
+}
+function scheduleSessionCleanup() {
+  const now = Date.now();
+  const bj = new Date(now + 8 * 3600_000);
+  let at = Date.UTC(bj.getUTCFullYear(), bj.getUTCMonth(), bj.getUTCDate()) - 8 * 3600_000 + CLEANUP_AT_MINUTES * 60_000;
+  if (at <= now) at += 86400_000;
+  const timer = setTimeout(() => {
+    try { runSessionCleanup(); } catch (err) { console.warn('[会话清理] 出错:', err.message); }
+    scheduleSessionCleanup();
+  }, at - now + Math.floor(Math.random() * 10 * 60_000));
+  timer.unref?.();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1773,4 +2107,8 @@ server.listen(PORT, HOST, () => {
   const pump = () => pumpInbox().catch((err) => console.error('[收件箱处理异常]:', err));
   pump();
   setInterval(pump, 1000);
+  // GPT 长时间不用自动切回；每天清理一次旧会话
+  setInterval(() => checkCodexIdle().catch((err) => console.error('[切换大脑] 检查出错:', err.message)), Number(process.env.ROUTINE_CODEX_IDLE_CHECK_MS) || 60_000);
+  scheduleSessionCleanup();
+  if (process.env.ROUTINE_SESSION_CLEANUP_ON_START === '1') setTimeout(() => { try { runSessionCleanup(); } catch (err) { console.warn('[会话清理] 出错:', err.message); } }, 3000);
 });

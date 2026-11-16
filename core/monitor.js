@@ -161,6 +161,11 @@ const EVENTS = {
       : `微信只允许机器人在对方最近一次发消息后约 24 小时内主动发消息。让${b.user}给${b.display}随便发一句话就能恢复；这期间${b.user}自己设的提醒会先留着，恢复后补发。`),
   },
   user_window_ok: { key: 'user_window', recovery: true, title: (b) => `${b.user}回消息了，${b.display}恢复正常` },
+  // GPT（Codex）本周额度用到 80%：用同一个账号的几个机器人谁先看到谁报（global：整台服务器算一件事，3 天内只发一次）
+  gpt_quota: {
+    key: 'gpt_quota', global: true, notice: true, event: true, dedupeMs: 3 * 86400_000, title: 'GPT 本周额度快用完了',
+    advice: () => '用完以后机器人会自动换回默认大脑；额度重置后跟机器人说「切到 GPT」就能接着用。',
+  },
 };
 
 // keys：每个问题的通知记录（有记录 = 已通知、还没恢复）；units：服务重启计数采样；retry：没发出去待重试的通知；
@@ -233,9 +238,9 @@ function checkBot(outgoing, bot, dedupeMs) {
     fs.rmSync(p, { force: true });
     if (!ev) continue;
     const meta = EVENTS[ev.kind] || { key: ev.kind, event: true, title: `其他问题（${ev.kind}）` };
-    notify(outgoing, `${bot.name}:${meta.key}`, {
+    notify(outgoing, meta.global ? meta.key : `${bot.name}:${meta.key}`, {
       ...base, at: ev.at || now, title: typeof meta.title === 'function' ? meta.title(bot, ev) : meta.title, detail: ev.detail,
-      recovery: Boolean(meta.recovery), sticky: Boolean(meta.sticky), event: Boolean(meta.event),
+      recovery: Boolean(meta.recovery), sticky: Boolean(meta.sticky), event: Boolean(meta.event), notice: Boolean(meta.notice),
       advice: meta.advice ? meta.advice(bot, ev) : '',
       ...(meta.dedupeMs ? { dedupeMs: meta.dedupeMs } : {}),
     }, meta.dedupeMs || dedupeMs);
