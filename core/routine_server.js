@@ -423,7 +423,12 @@ function codexTurnImage(threadId, sinceMs) {
   fs.copyFileSync(latest, dest);
   return dest;
 }
-const CODEX_WORK_NOTE = '\n[干活提示] clawbot-cap 这类命令要跑几十秒到几分钟：等它跑完、看到输出再决定下一步，没跑完就接着等，不要当成失败另想办法。用你自带的生图工具画的图，系统会自动发给主人，回复里不用写路径。\n';
+const CODEX_WORK_NOTE = `
+[干活提示]
+1. 新画的图直接用你自带的生图工具，画好后系统会自动发给主人，回复里不用写路径。只有要在主人发来的照片上改图时，才用 clawbot-cap image。
+2. clawbot-cap 这类命令要跑几十秒到几分钟：等它跑完、看到输出再决定下一步，没跑完就接着等，不要当成失败另想办法。
+3. 做好的文件（Word、PDF、表格、视频等）放在你的文件夹里，回复里单独一行写 file:// 加完整路径，系统才会发给主人，比如 file://${botRoot}/data/周报.docx
+`;
 function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
   try { fs.appendFileSync(tagsPath, 'GPT\n'); } catch {}
