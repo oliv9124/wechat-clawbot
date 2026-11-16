@@ -248,6 +248,10 @@ export const TOKEN_TTL_MS = Number(process.env.CLAWBOT_TOKEN_TTL_MS) || 24 * 360
 export const RECENT_TOKENS_MAX = 30;
 const tokenKey = (t) => crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 16);
 export const isPrepareFailed = (err) => /prepare failed/i.test(String(err?.message || ''));
+// 被拒（prepare failed）以后最多换几个凭证试、每次隔多久：被拒不一定是凭证用满了（文字太长、发得太快也是这个错），
+// 再多试也一样被拒，还白白把好凭证记成用满；连着狂发还可能招来微信的发送频率限制
+export const TOKEN_MAX_TRIES = Number(process.env.CLAWBOT_TOKEN_MAX_TRIES) || 3;
+const TOKEN_RETRY_GAP_MS = Number(process.env.CLAWBOT_TOKEN_RETRY_GAP_MS ?? 1000);
 const processRole = () => path.basename(process.argv[1] || 'process', '.js').replace(/[^A-Za-z0-9_-]/g, '_');
 const tokenStateDir = (botDir) => path.join(botDir || process.cwd(), 'data', 'state');
 
@@ -337,11 +341,12 @@ export async function sendWithTokenFallback(preferred, send, { botDir = null, la
   if (!all.length) throw new Error('缺少 context_token，无法回复微信消息！');
   const usedUp = usedUpKeys(botDir);
   const fresh = all.filter((t) => !usedUp.has(tokenKey(t)));
-  // 都记成用满了：还是拿最新的试一次（记录可能过时），免得一直卡住
-  const order = fresh.length ? fresh : all.slice(0, 1);
+  // 都记成用满了：还是拿最新的试一次（记录可能过时），免得一直卡住；最多试 TOKEN_MAX_TRIES 个，每次隔一会儿
+  const order = (fresh.length ? fresh : all.slice(0, 1)).slice(0, TOKEN_MAX_TRIES);
   let lastErr = null;
   let tried = 0;
   for (const t of order) {
+    if (tried > 0 && TOKEN_RETRY_GAP_MS > 0) await new Promise((r) => setTimeout(r, TOKEN_RETRY_GAP_MS));
     tried += 1;
     try {
       const res = await send(t);
@@ -392,6 +397,47 @@ async function postSendmessage(config, req, label = 'sendmessage') {
   return json;
 }
 
+// 微信单条文字有大小上限：大约 16KB（UTF-8），超了也返回 prepare failed，和凭证用满分不出来
+// （11-16 一条 7236 字、约 17KB 的回复就这样没发出去，还把最近的凭证全记成了用满）。
+// 超过 TEXT_MAX_BYTES 的文字按段落（没有段落就按行、按句子，实在没有就硬切）拆成几条发，每条末尾标（1/2）（2/2）
+export const TEXT_MAX_BYTES = Number(process.env.CLAWBOT_TEXT_MAX_BYTES) || 12000;
+const TEXT_PART_GAP_MS = Number(process.env.CLAWBOT_TEXT_PART_GAP_MS ?? 1500);
+// 不超过 maxBytes 字节的最长开头（按字符算，不会把一个字拆开）
+function prefixWithinBytes(str, maxBytes) {
+  let bytes = 0;
+  let idx = 0;
+  for (const ch of str) {
+    const b = Buffer.byteLength(ch, 'utf8');
+    if (bytes + b > maxBytes) break;
+    bytes += b;
+    idx += ch.length;
+  }
+  return idx;
+}
+export function splitTextForWechat(text, maxBytes = TEXT_MAX_BYTES) {
+  const s = String(text ?? '');
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return [s];
+  const budget = maxBytes - 32; // 留给末尾的（1/2）
+  const parts = [];
+  let rest = s;
+  while (Buffer.byteLength(rest, 'utf8') > budget) {
+    const limit = prefixWithinBytes(rest, budget);
+    const window = rest.slice(0, limit);
+    const floor = Math.floor(limit / 2); // 断点至少在后一半，免得拆出很短的一条
+    let at = -1;
+    for (const re of [/\n[ \t]*\n/g, /\n/g, /[。！？!?；;]/g, /[，,、 ]/g]) {
+      for (const m of window.matchAll(re)) if (m.index + m[0].length >= floor) at = m.index + m[0].length;
+      if (at > 0) break;
+    }
+    if (at <= 0) at = limit;
+    const chunk = rest.slice(0, at).trimEnd();
+    if (chunk) parts.push(chunk);
+    rest = rest.slice(at).replace(/^\s*\n/, '');
+  }
+  if (rest.trim()) parts.push(rest);
+  return parts.length > 1 ? parts.map((p, i) => `${p}\n（${i + 1}/${parts.length}）`) : parts;
+}
+
 /**
  * Send reply text message back to WeChat via iLink sendmessage API.
  * opts.botDir：用哪个实例目录里的回复凭证（默认当前目录；监控替别的机器人发时传它的目录）
@@ -403,8 +449,10 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
   }
 
   const plainText = stripMarkdown(replyText);
+  // 太长的拆成几条发（见 splitTextForWechat）
+  const parts = splitTextForWechat(plainText);
   // 每次尝试都用新的 client_id：换了凭证的重发不能被当成同一条
-  const payload = (ctx) => ({
+  const payload = (ctx, text) => ({
     msg: {
       from_user_id: '',
       to_user_id: toUserId,
@@ -416,7 +464,7 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
         {
           type: 1,
           text_item: {
-            text: plainText,
+            text,
           },
         },
       ],
@@ -427,9 +475,14 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
     },
   });
 
-  console.log(`[sendmessage 发送给微信]: to=${toUserId} 文本 ${describeText(plainText)}`);
-  const json = await sendWithTokenFallback(contextToken, (ctx) => postSendmessage(config, payload(ctx)), { botDir: opts.botDir, label: '文字' });
-  console.log(`[sendmessage success] to=${toUserId} msg_id=${json.message_id || 'ok'}`);
+  if (parts.length > 1) console.log(`[sendmessage] 这条文字 ${Buffer.byteLength(plainText, 'utf8')} 字节，超过单条上限，分成 ${parts.length} 条发`);
+  let json = null;
+  for (const [i, text] of parts.entries()) {
+    if (i > 0 && TEXT_PART_GAP_MS > 0) await new Promise((r) => setTimeout(r, TEXT_PART_GAP_MS));
+    console.log(`[sendmessage 发送给微信]: to=${toUserId} 文本 ${describeText(text)}${parts.length > 1 ? `（第 ${i + 1}/${parts.length} 条）` : ''}`);
+    json = await sendWithTokenFallback(contextToken, (ctx) => postSendmessage(config, payload(ctx, text)), { botDir: opts.botDir, label: '文字' });
+    console.log(`[sendmessage success] to=${toUserId} msg_id=${json.message_id || 'ok'}`);
+  }
   return json;
 }
 
