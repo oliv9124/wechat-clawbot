@@ -19,8 +19,6 @@ export const MEMORY_MAX_CHARS = 3000;
 export const TOPIC_MAX_CHARS = 5000;
 export const MAX_TOPICS_PER_MESSAGE = 2;
 export const TIMELINE_LOAD_MAX_CHARS = 3000;
-// 已取消"小专题每条消息都带"：专题只在聊到时带。留着这个名字只为兼容旧代码
-export const TOPIC_ALWAYS_BUDGET = 0;
 export const TOPICS_DIR = 'data/memory/topics';
 export const LIBRARY_DIR = 'data/memory/library';
 export const TIMELINE_DIR = 'data/memory/timeline';

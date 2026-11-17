@@ -28,17 +28,9 @@ if (!fs.existsSync(dataDir)) {
   try { fs.mkdirSync(dataDir, { recursive: true }); } catch {}
 }
 
-const STATE_FILE = fs.existsSync(dataDir)
-  ? path.join(dataDir, 'scheduler_state.json')
-  : path.join(botRoot, 'scheduler_state.json');
-
-const REMINDERS_FILE = fs.existsSync(dataDir)
-  ? path.join(dataDir, 'reminders.json')
-  : path.join(botRoot, 'reminders.json');
-
-const LOG_FILE = fs.existsSync(dataDir)
-  ? path.join(dataDir, 'chat_history.log')
-  : path.join(botRoot, 'chat_history.log');
+const STATE_FILE = path.join(dataDir, 'scheduler_state.json');
+const REMINDERS_FILE = path.join(dataDir, 'reminders.json');
+const LOG_FILE = path.join(dataDir, 'chat_history.log');
 
 function appendLog(line) {
   const timestamp = new Date().toISOString();

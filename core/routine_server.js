@@ -75,9 +75,7 @@ const historyDir = path.join(dataDir, 'history');
 if (!fs.existsSync(historyDir)) {
   try { fs.mkdirSync(historyDir, { recursive: true }); } catch {}
 }
-const LOG_FILE = fs.existsSync(dataDir)
-  ? path.join(dataDir, 'chat_history.log')
-  : path.join(botRoot, 'chat_history.log');
+const LOG_FILE = path.join(dataDir, 'chat_history.log');
 
 function getBeijingDateStr(offsetDays = 0) {
   const d = new Date(Date.now() + offsetDays * 86400000);
@@ -409,9 +407,6 @@ function codexTokenInfo(threadId) {
   }
   console.warn(`[Codex] 没找到会话 ${threadId} 的用量记录，这次不按大小换会话`);
   return out;
-}
-function codexContextTokens(threadId) {
-  return codexTokenInfo(threadId).context;
 }
 // GPT 这一轮画的图：它自带的生图工具固定存在 CODEX_HOME/generated_images/<会话ID>/（不在机器人目录里，系统发不出去），
 // clawbot-cap 画的在 data/cap/images/。回复里没带图时，取这一轮最新的一张复制到机器人自己的 data/gpt-images/（刚复制的文件才会被发送）
@@ -835,11 +830,6 @@ function lastRotationBoundary(now = Date.now()) {
 function conversationRotationReason(state, convId) {
   if (!convId) return null;
   const startedAt = Number(state.conversation_started_at) || 0;
-  if (!startedAt) {
-    // 以前存下的会话没有开始时间：从现在算起，过了下一个 03:30 再换
-    saveRuntimeState('routine', { conversation_started_at: Date.now() });
-    return null;
-  }
   if (startedAt < lastRotationBoundary()) return '已经过了凌晨整理记忆的时间';
   const tokens = Number(state.conversation_tokens) || 0;
   if (tokens > ROTATE_MAX_TOKENS) return `会话已经有 ${(tokens / 10000).toFixed(1)} 万 token`;

@@ -111,7 +111,6 @@ function git(repo, args, { input, allowFail = false, env = {} } = {}) {
 
 const repoDir = (bot) => path.join(settings.historyDir, bot);
 const head = (repo) => git(repo, ['rev-parse', 'HEAD']).trim();
-const rootCommit = (repo) => git(repo, ['rev-list', '--max-parents=0', 'HEAD']).trim().split('\n').pop();
 const isCommit = (repo, c) => Boolean(c) && git(repo, ['cat-file', '-e', `${c}^{commit}`], { allowFail: true }) !== null;
 const subjectOf = (repo, c) => git(repo, ['show', '-s', '--format=%s', c]).trim();
 const commitTime = (repo, c) => Number(git(repo, ['show', '-s', '--format=%ct', c]).trim()) * 1000;
