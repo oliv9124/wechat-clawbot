@@ -5,17 +5,15 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, getConfigPath, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT, mergeRecentTokens } from './wechat_reply.js';
+import { loadConfig, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT, mergeRecentTokens } from './wechat_reply.js';
 import { enqueueInbox } from './inbox.js';
 import { raiseAlert } from './alert.js';
 
 // 凭证过期后多久再试一次：退出重启只会每几秒撞一次接口，没有意义（环境变量仅供测试缩短）
 const CREDENTIAL_RETRY_MS = Number(process.env.FORWARDER_CREDENTIAL_RETRY_MS) || 10 * 60 * 1000;
-// 没有上次的读取位置、只能从头收时（新装、重新扫码、旧版留下的位置太旧），微信会把最近一段时间的旧消息再给一遍。
+// 没有上次的读取位置、只能从头收时（新装、重新扫码），微信会把最近一段时间的旧消息再给一遍。
 // 这时启动前这么久以前的消息只记日志、不处理（环境变量仅供测试）
 const STALE_MESSAGE_MS = Number(process.env.FORWARDER_STALE_MESSAGE_MS) || 10 * 60 * 1000;
-// 旧版把读取位置记在 config.json 里，每次收消息都会写一遍。config.json 在这段时间内写过，才接着用旧版的位置
-const LEGACY_CURSOR_MAX_AGE_MS = Number(process.env.FORWARDER_LEGACY_CURSOR_MAX_AGE_MS) || 24 * 60 * 60 * 1000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
@@ -129,30 +127,14 @@ function agoText(ms) {
 /**
  * 启动时决定从哪个读取位置（get_updates_buf）接着收消息：
  *   - data/state/forwarder.json 里有这一项：照用。重新扫码后它被清成 ''，就从头收；
- *   - 从来没有这一项（旧版刚升级上来），config.json 里有旧版留下的位置，而且 config.json 最近 24 小时内写过：
- *     把位置搬进 data/state/forwarder.json 接着收，升级时不会把收过的消息再收一遍（config.json 不动）；
- *   - 都没有：从头收。
+ *   - 没有：从头收。
+ *（10-19 以前的旧版把位置记在 config.json 里，11-14 加过把它搬过来的处理；两台服务器都搬完了，公开版从来没有这种布局，11-17 删掉）
  * 返回 { cursor, fresh }：fresh 为 true 表示从头收，微信补给的旧消息要跳过。
  */
-function resolveStartCursor(config) {
+function resolveStartCursor() {
   const state = loadRuntimeState('forwarder');
   if (typeof state.get_updates_buf === 'string') {
     return { cursor: state.get_updates_buf, fresh: !state.get_updates_buf };
-  }
-  const legacy = typeof config.get_updates_buf === 'string' ? config.get_updates_buf : '';
-  if (legacy) {
-    let ageMs = Infinity;
-    try {
-      ageMs = Date.now() - fs.statSync(getConfigPath()).mtimeMs;
-    } catch {}
-    if (ageMs <= LEGACY_CURSOR_MAX_AGE_MS) {
-      const moved = { get_updates_buf: legacy };
-      if (!state.last_context_token && config.last_context_token) moved.last_context_token = config.last_context_token;
-      saveRuntimeState('forwarder', moved);
-      console.log('[升级] 接上了旧版记在 config.json 里的读取位置，收过的消息不会再收一遍。');
-      return { cursor: legacy, fresh: false };
-    }
-    console.log(`[升级] config.json 里旧版的读取位置是 ${agoText(ageMs)}写的，太旧不用，从头收。`);
   }
   return { cursor: '', fresh: true };
 }
@@ -171,7 +153,7 @@ async function startPolling() {
   console.log(`已绑定用户: ${config.authorized_user_id || '（未绑定，将拒收所有消息，请运行 login.js 扫码绑定）'}`);
   console.log(`消息收件箱: ${path.join(botRoot, 'data', 'inbox', 'pending')}`);
 
-  const start = resolveStartCursor(config);
+  const start = resolveStartCursor();
   let getUpdatesBuf = start.cursor;
   // 从头收时，比这个时间早的消息是微信补给的旧消息（已经回答过，或者早就过时了），跳过
   const staleBefore = start.fresh ? Date.now() - STALE_MESSAGE_MS : 0;

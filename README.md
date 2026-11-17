@@ -57,7 +57,7 @@
 ```text
 ├── install.sh                # 检查环境、安装依赖、准备 starter-bot
 ├── ecosystem.monitor.cjs     # 可选：告警监控（PM2，一台机器一个）
-├── AGENTS.md / GEMINI.md     # 给智能体的规则（联网核实、视频发送、提醒、进程安全等）
+├── AGENTS.md                 # 给智能体的规则（联网核实、视频发送、提醒、进程安全等）
 ├── LICENSE                   # MIT 许可证
 ├── scripts/new_bot.sh        # 新建一个机器人
 ├── deploy/set_alert_email.sh # 可选：配置告警邮件

@@ -44,7 +44,6 @@ const AGENT_ERROR_KINDS = { timeout: '超时没完成', error: '调用出错' };
 const CODE_DIR = process.env.CLAWBOT_CODE_DIR || PROJECT_DIR;
 const CODE_DIRTY_AFTER_MS = env('MONITOR_CODE_DIRTY_AFTER_MS', 10 * 60_000);
 const SEND_MAIL = path.join(path.dirname(fileURLToPath(import.meta.url)), 'send_mail.py');
-const HAS_WARP = ['/usr/bin/warp-cli', '/usr/local/bin/warp-cli'].some((p) => fs.existsSync(p));
 const ROLES = { routine: '消息处理', forwarder: '消息接收', scheduler: '定时任务' };
 
 const readJson = (p) => {
@@ -289,7 +288,7 @@ function checkBot(outgoing, bot, dedupeMs) {
       notify(outgoing, key, {
         ...base, title: `${bot.display}的智能体（agy）连续 ${agent.streak} 次调用失败`,
         detail: `最近一次：${AGENT_ERROR_KINDS[agent.errorKind] || '出错'}（${agent.error}）`,
-        advice: `可能是额度用完、网络或代理断了。${HAS_WARP ? '代理状态：warp-cli --accept-tos status（应显示 Connected）；' : ''}${logsOf('routine', bot)}`,
+        advice: `可能是额度用完、网络或代理断了。${logsOf('routine', bot)}`,
       }, dedupeMs);
     } else {
       notify(outgoing, key, { ...base, title: `${bot.display}的智能体（agy）恢复正常`, recovery: true }, dedupeMs);
