@@ -8,7 +8,7 @@ import {
   prepareWorkCopy, discardWorkCopy, collectChanges, checkChanges, applyChanges, slimFile, overLimitFiles, agyPlanAgent,
   numberMemory, parseChangeList, applyChangeList,
 } from './memory_slim.js';
-import { memoryMode, useStandaloneHistory, snapshotAll, buildDigest, markDigestDelivered, syncBotDigests } from './memory_history.js';
+import { memoryMode, useStandaloneHistory, snapshotAll, buildDigest, markDigestDelivered } from './memory_history.js';
 import { raiseAlert } from './alert.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, recordAgentResult } from './agent_health.js';
 import { callAiCopy } from './ai_copy.js';
@@ -19,7 +19,7 @@ const botRoot = process.cwd();
 const MEMORY_MODE = memoryMode(botRoot);
 if (MEMORY_MODE === 'standalone') useStandaloneHistory(botRoot);
 // 这个进程自己存版本、附带编号能撤销的汇报
-const MEMORY_REVIEW = MEMORY_MODE === 'owner' || MEMORY_MODE === 'standalone';
+const MEMORY_REVIEW = MEMORY_MODE === 'standalone';
 const SNAPSHOT_EVERY_MS = Number(process.env.CLAWBOT_MEMORY_SNAPSHOT_MS) || 60_000;
 
 // 数据目录支持
@@ -35,6 +35,24 @@ const LOG_FILE = path.join(dataDir, 'chat_history.log');
 function appendLog(line) {
   const timestamp = new Date().toISOString();
   fs.appendFileSync(LOG_FILE, `[${timestamp}] ${line}\n`, 'utf-8');
+}
+
+// 发出去的定时消息和提醒，也按机器人回复的格式记进当天的按天日志（data/history/chat_YYYY-MM-DD.log，北京时间）：
+// 机器人拼"最近聊天"、凌晨整理记忆读的都是按天日志。以前只记在总日志里，机器人不知道自己发过什么，
+// 主人回一句"带了"就接不上（11-17）。早间的"记忆变动"汇报不记，免得被凌晨整理当成对话
+function appendDailyChat(label, text) {
+  if (!text) return;
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(new Date()).map((p) => [p.type, p.value]));
+    const dir = path.join(dataDir, 'history');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, `chat_${parts.year}-${parts.month}-${parts.day}.log`),
+      `[${new Date().toISOString()}] AI回复(${label}): ${text}\n`, 'utf-8');
+  } catch (err) {
+    console.warn('[写入按天日志失败]:', err.message);
+  }
 }
 
 function loadState() {
@@ -329,6 +347,7 @@ async function deliverTask(task, { todayStr, late = '', digestOnly = false }) {
         throw sendErr;
       }
       sentText = nudge.text;
+      appendDailyChat('定时', text);
     }
 
     let digestLeft = false;
@@ -501,6 +520,7 @@ async function deliverDueReminders() {
         try {
           await sendWechatReply(toUser, ctxToken, nudge.text, config);
           appendLog(`[动态提醒下发成功]: ${item.ai ? body.text : item.content}`);
+          appendDailyChat('提醒', `${body.text}${late}`);
           console.log(`✅ [动态提醒已发送微信]: ${describeText(nudge.text)}${late ? '（补发）' : ''}${body.note}`);
         } catch (e) {
           nudge.undo();
@@ -927,7 +947,6 @@ function checkMemorySnapshots() {
     for (const s of snapshotAll({ botsDir: path.dirname(botRoot) })) {
       console.log(`[记忆历史] ${s.bot} 的记忆有改动，存了一版 ${s.commit.slice(0, 7)}`);
     }
-    if (MEMORY_MODE === 'owner') syncBotDigests({ botsDir: path.dirname(botRoot) });
   } catch (e) {
     console.error('[记忆快照失败]:', e.message);
     if (Date.now() - lastSnapshotAlertAt > 3600_000) {

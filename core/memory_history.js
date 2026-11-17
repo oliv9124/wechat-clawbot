@@ -72,16 +72,12 @@ function gitAvailable() {
  * 这个实例的版本记录怎么管：
  *   managed    服务配置里设了 CLAWBOT_MEMORY_MODE=managed（服务模板里都设了）：由管理服务统一管，
  *              早间播报附上它准备好的汇报，管理指令转给它处理
- *   standalone 默认：自己管自己
- *   owner      旧的统一管理方式：主人的机器人以 root 运行、又没写明模式时，在自己的进程里管所有实例（只为兼容保留）
+ *   standalone 默认：自己管自己，以 root 运行的也一样（10-22 起的"主人的机器人在自己进程里管所有实例"那种方式 11-17 删了，统一管理只靠管理服务）
  *   off        设了 CLAWBOT_MEMORY_MODE=off，或者没装 git：不存版本
  */
 export function memoryMode(botRoot) {
   const forced = process.env.CLAWBOT_MEMORY_MODE;
   if (forced === 'managed' || forced === 'off') return forced;
-  try {
-    if (process.getuid?.() === 0 && ownerBotName() === path.basename(botRoot)) return 'owner';
-  } catch {}
   return gitAvailable() ? 'standalone' : 'off';
 }
 

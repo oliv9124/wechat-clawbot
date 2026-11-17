@@ -49,7 +49,7 @@ const botRoot = process.cwd();
 // 被代管的实例照常交给智能体
 const MEMORY_MODE = memoryMode(botRoot);
 if (MEMORY_MODE === 'standalone') useStandaloneHistory(botRoot);
-const MEMORY_REVIEW = MEMORY_MODE === 'owner' || MEMORY_MODE === 'standalone';
+const MEMORY_REVIEW = MEMORY_MODE === 'standalone';
 // 统一管理（managed）：管理指令写成请求交给管理服务，它处理完直接经这个机器人的微信回复
 const MANAGED = MEMORY_MODE === 'managed';
 const REQUEST_WAIT_MS = Number(process.env.CLAWBOT_REQUEST_WAIT_MS) || 20_000;
@@ -332,7 +332,8 @@ try {
 // ---------- GPT 大脑（Codex CLI） ----------
 // config.json 里 codex_brain:true 的机器人可以把消息交给 Codex：「用 GPT …」只这一条，「切到 GPT」之后都用，「切回来」换回 Antigravity。
 // Codex 用这个机器人自己的登录（CLAWBOT_CODEX_HOME，一个机器人一份，不复制别人的）；会话 ID 和 Antigravity 的分开记（运行状态 codex）。
-const CODEX_EXE = process.env.CLAWBOT_CODEX_EXE || '/opt/codex-mcp/runtime/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex';
+// 用哪个 Codex：服务里用 CLAWBOT_CODEX_EXE 指定；不指定就用 PATH 里的 codex
+const CODEX_EXE = process.env.CLAWBOT_CODEX_EXE || 'codex';
 const CODEX_HOME_DIR = process.env.CLAWBOT_CODEX_HOME || path.join(process.env.HOME || botRoot, '.codex');
 // GPT 会话现在多大（最近一次请求的输入 token）超过这个数就开新会话；另外和 Antigravity 一样，过了凌晨整理记忆的时间也开新会话。
 // 原来 8 万：会话越大，每一步都要把整段会话重发一遍，越用越贵，改成 6 万
