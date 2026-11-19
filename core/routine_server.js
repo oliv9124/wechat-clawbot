@@ -149,6 +149,15 @@ function isDeliverableFile(filePath) {
   return true;
 }
 
+// 机器人自己的记忆、记忆历史、运行状态、聊天记录、转给管理服务的请求、规则和技能：回复里写了路径也不当成交付物发。
+// 11-18 一个机器人回抖音链接时顺口说了刚改的专题笔记的路径，那份 .md 就被当文件发给了用户
+const INTERNAL_DIRS = ['data/memory', 'data/memory-history', 'data/state', 'data/history', 'data/requests', '.agents'];
+function isInternalPath(p) {
+  let real = p;
+  try { real = fs.realpathSync(p); } catch {}
+  return INTERNAL_DIRS.some((d) => real.startsWith(path.join(botRoot, d) + path.sep));
+}
+
 // 检查文件是否安全属于当前 Bot 作用域：只允许本实例目录，或 /tmp 里由本进程用户创建的临时交付物，杜绝跨号串发。
 // 先解析软链接，防止用链接指到实例目录以外；前缀比较带上分隔符，避免 bots/bot2 被当成 bots/bot。
 function isPathAllowedForThisBot(p) {
@@ -181,7 +190,7 @@ function extractMediaPaths(text) {
   const fileUrlRegex = /file:\/\/(\/[^\s\)\"\'\<\>]+)/gi;
   for (const m of text.matchAll(fileUrlRegex)) {
     const p = m[1];
-    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p)) continue;
+    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p) || isInternalPath(p)) continue;
     if (fs.existsSync(p) && fs.statSync(p).isFile()) {
       const stats = fs.statSync(p);
       const isRecent = (Date.now() - stats.mtimeMs) < 600000; // 仅推送10分钟内生成的文件
@@ -200,7 +209,7 @@ function extractMediaPaths(text) {
   const absPathRegex = /(\/(?:srv|root|tmp)[^\s\)\"\'\<\>]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|doc|xlsx|xls|pptx|ppt|csv|txt|zip|tar\.gz|md|html|htm|mp4|mov|m4v|mp3|m4a|wav))/gi;
   for (const m of text.matchAll(absPathRegex)) {
     const p = m[1];
-    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p)) continue;
+    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p) || isInternalPath(p)) continue;
     if (fs.existsSync(p) && fs.statSync(p).isFile()) {
       const stats = fs.statSync(p);
       const isRecent = (Date.now() - stats.mtimeMs) < 600000; // 仅推送10分钟内生成的文件
@@ -220,7 +229,7 @@ function extractMediaPaths(text) {
   const quotedPathRegex = /[`"'](\/(?:srv|root|tmp)[^`"'\r\n]+?\.(?:jpg|jpeg|png|gif|webp|pdf|docx|doc|xlsx|xls|pptx|ppt|csv|txt|zip|tar\.gz|md|html|htm|mp4|mov|m4v|mp3|m4a|wav))[`"']/gi;
   for (const m of text.matchAll(quotedPathRegex)) {
     const p = m[1].trim();
-    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p)) continue;
+    if (!isPathAllowedForThisBot(p) || isIncomingWechatMedia(p) || isInternalPath(p)) continue;
     if (fs.existsSync(p) && fs.statSync(p).isFile()) {
       const stats = fs.statSync(p);
       const isRecent = (Date.now() - stats.mtimeMs) < 600000;
@@ -966,9 +975,22 @@ async function deliverResultToWechat(toUserId, contextToken, textReply, rawAgent
     try {
       if (isAsyncCallback) await pushRateLimiter.acquirePermission();
       console.log(`[正在上传并发送原生视频卡片至微信]: ${describePath(latestVideo)}`);
-      await uploadAndSendWechatVideo(toUserId, contextToken, latestVideo, config);
+      const sent = await uploadAndSendWechatVideo(toUserId, contextToken, latestVideo, config);
       markMediaSent(latestVideo);
-      console.log(`[已成功将原生视频卡片发送至微信]: ${describePath(latestVideo)}`);
+      if (sent?.fallback) {
+        // 重试了几次还是没传上，按文件发的：跟用户说一声，不然看到的是一个 .mp4 文件，以为没按要求发
+        console.log(`[视频卡片没发成，改成文件发了]: ${describePath(latestVideo)}`);
+        const note = '（这个视频的播放卡片微信那边没传上去，先按文件发你了，点开一样能看。要卡片的话，过一会儿跟我说"再发一次"。）';
+        try {
+          if (isAsyncCallback) await pushRateLimiter.acquirePermission();
+          await sendWechatReply(toUserId, contextToken, note, config);
+          appendLog(`AI回复(提示): ${note}`);
+        } catch (noteErr) {
+          console.error('[视频改成文件发的提示没发出去]:', noteErr.message);
+        }
+      } else {
+        console.log(`[已成功将原生视频卡片发送至微信]: ${describePath(latestVideo)}`);
+      }
     } catch (vidErr) {
       console.error(`[发送微信原生视频卡片失败]:`, vidErr.message);
     }

@@ -491,74 +491,14 @@ export async function sendWechatReply(toUserId, contextToken, replyText, overrid
  */
 export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath, overrideConfig, opts = {}) {
   const config = overrideConfig || loadConfig();
-  const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
-  const token = config.bot_token;
 
   if (!fs.existsSync(imagePath)) {
     throw new Error(`图片文件不存在: ${imagePath}`);
   }
 
   const buf = fs.readFileSync(imagePath);
-  const rawsize = buf.length;
-  const rawfilemd5 = crypto.createHash('md5').update(buf).digest('hex');
-  const filesize = Math.ceil((rawsize + 1) / 16) * 16;
-  const filekey = crypto.randomBytes(16).toString('hex');
-  const aeskeyBuffer = crypto.randomBytes(16);
-  const aeskeyHex = aeskeyBuffer.toString('hex');
-
-  const uploadUrlReq = {
-    filekey,
-    media_type: 1, // IMAGE
-    to_user_id: toUserId,
-    rawsize,
-    rawfilemd5,
-    filesize,
-    no_need_thumb: true,
-    aeskey: aeskeyHex,
-    base_info: { channel_version: '2.4.10', bot_agent: 'OpenClaw' },
-  };
-
-  const urlRes = await fetch(`${baseUrl}/ilink/bot/getuploadurl`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      AuthorizationType: 'ilink_bot_token',
-      Authorization: `Bearer ${token.trim()}`,
-      'X-WECHAT-UIN': randomWechatUin(),
-      'iLink-App-Id': 'bot',
-      'iLink-App-ClientVersion': '132106',
-    },
-    body: JSON.stringify(uploadUrlReq),
-  });
-
-  const urlData = await urlRes.json();
-  const targetUrl =
-    urlData.upload_full_url?.trim() ||
-    (urlData.upload_param
-      ? `https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=${encodeURIComponent(urlData.upload_param)}&filekey=${encodeURIComponent(filekey)}`
-      : null);
-
-  if (!targetUrl) {
-    throw new Error(`无法获取 CDN 上传链接: ${JSON.stringify(urlData)}`);
-  }
-
-  // Encrypt with AES-128-ECB
-  const cipher = crypto.createCipheriv('aes-128-ecb', aeskeyBuffer, null);
-  const ciphertext = Buffer.concat([cipher.update(buf), cipher.final()]);
-
-  const cdnRes = await fetch(targetUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: new Uint8Array(ciphertext),
-  });
-
-  const downloadParam = cdnRes.headers.get('x-encrypted-param');
-  if (!downloadParam) {
-    throw new Error('CDN 上传未返回 x-encrypted-param 下载凭证');
-  }
-
-  // 关键：微信客户端要求 aes_key 为 32 位 Hex 字符的 Base64 编码
-  const aesKeyBase64OfHex = Buffer.from(aeskeyHex).toString('base64');
+  // 上传（没传上会重试）；aes_key 是 32 位 Hex 字符的 Base64 编码（微信客户端要求）
+  const { downloadParam, aeskeyHex, aesKeyBase64OfHex, ciphertextLength } = await uploadBufferToCdn(buf, 1, toUserId, config);
   const clientId = `openclaw-weixin:${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const sendReq = {
     msg: {
@@ -578,8 +518,8 @@ export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath
               encrypt_type: 1,
             },
             aeskey: aeskeyHex,
-            mid_size: ciphertext.length,
-            hd_size: ciphertext.length,
+            mid_size: ciphertextLength,
+            hd_size: ciphertextLength,
           },
         },
       ],
@@ -602,72 +542,13 @@ export async function uploadAndSendWechatImage(toUserId, contextToken, imagePath
  */
 export async function uploadAndSendWechatFile(toUserId, contextToken, filePath, overrideConfig, opts = {}) {
   const config = overrideConfig || loadConfig();
-  const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
-  const token = config.bot_token;
 
   if (!fs.existsSync(filePath)) {
     throw new Error(`文件不存在: ${filePath}`);
   }
 
   const buf = fs.readFileSync(filePath);
-  const rawsize = buf.length;
-  const rawfilemd5 = crypto.createHash('md5').update(buf).digest('hex');
-  const filesize = Math.ceil((rawsize + 1) / 16) * 16;
-  const filekey = crypto.randomBytes(16).toString('hex');
-  const aeskeyBuffer = crypto.randomBytes(16);
-  const aeskeyHex = aeskeyBuffer.toString('hex');
-
-  const uploadUrlReq = {
-    filekey,
-    media_type: 3, // MEDIA_FILE
-    to_user_id: toUserId,
-    rawsize,
-    rawfilemd5,
-    filesize,
-    aeskey: aeskeyHex,
-    base_info: { channel_version: '2.4.10', bot_agent: 'OpenClaw' },
-  };
-
-  const urlRes = await fetch(`${baseUrl}/ilink/bot/getuploadurl`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      AuthorizationType: 'ilink_bot_token',
-      Authorization: `Bearer ${token.trim()}`,
-      'X-WECHAT-UIN': randomWechatUin(),
-      'iLink-App-Id': 'bot',
-      'iLink-App-ClientVersion': '132106',
-    },
-    body: JSON.stringify(uploadUrlReq),
-  });
-
-  const urlData = await urlRes.json();
-  const targetUrl =
-    urlData.upload_full_url?.trim() ||
-    (urlData.upload_param
-      ? `https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=${encodeURIComponent(urlData.upload_param)}&filekey=${encodeURIComponent(filekey)}`
-      : null);
-
-  if (!targetUrl) {
-    throw new Error(`无法获取 CDN 上传链接: ${JSON.stringify(urlData)}`);
-  }
-
-  // Encrypt with AES-128-ECB
-  const cipher = crypto.createCipheriv('aes-128-ecb', aeskeyBuffer, null);
-  const ciphertext = Buffer.concat([cipher.update(buf), cipher.final()]);
-
-  const cdnRes = await fetch(targetUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: new Uint8Array(ciphertext),
-  });
-
-  const downloadParam = cdnRes.headers.get('x-encrypted-param');
-  if (!downloadParam) {
-    throw new Error('CDN 上传未返回 x-encrypted-param 下载凭证');
-  }
-
-  const aesKeyBase64OfHex = Buffer.from(aeskeyHex).toString('base64');
+  const { downloadParam, aesKeyBase64OfHex, rawsize } = await uploadBufferToCdn(buf, 3, toUserId, config, { noNeedThumb: false });
   const clientId = `openclaw-weixin-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const fileName = path.basename(filePath);
 
@@ -707,12 +588,11 @@ export async function uploadAndSendWechatFile(toUserId, contextToken, filePath, 
   return sendData;
 }
 
-/**
- * Generic buffer upload to Tencent Weixin C2C CDN.
- * media_type: 1 = Image, 3 = File, 4 = Video
- */
-export async function uploadBufferToCdn(buf, media_type, toUserId, overrideConfig) {
-  const config = overrideConfig || loadConfig();
+// 微信 CDN 偶尔不回下载凭证：11-18 一个机器人发 4.7 MB 的抖音视频，第一次没回，直接降级成了 mp4 文件，
+// 14 分钟后同一个文件一次就传上了。所以没传上就换一个上传链接重传，一共最多 3 次，中间等 2 秒、5 秒（环境变量仅供测试）
+const CDN_RETRY_WAIT_MS = String(process.env.CLAWBOT_CDN_RETRY_WAIT_MS || '2000,5000').split(',').map(Number).filter((n) => n >= 0);
+
+async function uploadBufferToCdnOnce(buf, media_type, toUserId, config, noNeedThumb) {
   const baseUrl = config.base_url || 'https://ilinkai.weixin.qq.com';
   const token = config.bot_token;
 
@@ -730,7 +610,7 @@ export async function uploadBufferToCdn(buf, media_type, toUserId, overrideConfi
     rawsize,
     rawfilemd5,
     filesize,
-    no_need_thumb: true,
+    ...(noNeedThumb ? { no_need_thumb: true } : {}),
     aeskey: aeskeyHex,
     base_info: { channel_version: '2.4.10', bot_agent: 'OpenClaw' },
   };
@@ -771,7 +651,9 @@ export async function uploadBufferToCdn(buf, media_type, toUserId, overrideConfi
 
   const downloadParam = cdnRes.headers.get('x-encrypted-param');
   if (!downloadParam) {
-    throw new Error('CDN 上传未返回 x-encrypted-param 下载凭证');
+    // 带上 HTTP 状态和 CDN 给的原因，下次再出现好查
+    const why = String(cdnRes.headers.get('x-error-message') || '').slice(0, 100);
+    throw new Error(`CDN 上传未返回 x-encrypted-param 下载凭证（HTTP ${cdnRes.status}${why ? `，${why}` : ''}）`);
   }
 
   const aesKeyBase64OfHex = Buffer.from(aeskeyHex).toString('base64');
@@ -782,6 +664,27 @@ export async function uploadBufferToCdn(buf, media_type, toUserId, overrideConfi
     rawsize,
     ciphertextLength: ciphertext.length,
   };
+}
+
+/**
+ * Upload a buffer to Tencent Weixin C2C CDN; a failed upload is retried with a fresh upload link.
+ * media_type: 1 = Image, 2 = Video, 3 = File。图片、文件、视频和封面都走这里
+ */
+export async function uploadBufferToCdn(buf, media_type, toUserId, overrideConfig, { noNeedThumb = true } = {}) {
+  const config = overrideConfig || loadConfig();
+  let lastErr = null;
+  for (let attempt = 0; attempt <= CDN_RETRY_WAIT_MS.length; attempt++) {
+    if (attempt > 0) {
+      console.warn(`[CDN 上传没成功，${CDN_RETRY_WAIT_MS[attempt - 1] / 1000} 秒后换个上传链接再传（第 ${attempt + 1} 次）]: ${lastErr.message}`);
+      await new Promise((r) => setTimeout(r, CDN_RETRY_WAIT_MS[attempt - 1]));
+    }
+    try {
+      return await uploadBufferToCdnOnce(buf, media_type, toUserId, config, noNeedThumb);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -816,35 +719,38 @@ export async function uploadAndSendWechatVideo(toUserId, contextToken, videoPath
     console.warn('[ffprobe 读取视频时长失败，使用默认值]:', e.message);
   }
 
-  try {
-    execFileSync('ffmpeg', [
-      '-y',
-      '-i', videoPath,
-      '-ss', '00:00:01',
-      '-vframes', '1',
-      tempThumb,
-    ], { stdio: 'ignore', timeout: 10000 });
-
-    if (fs.existsSync(tempThumb)) {
-      thumbBuf = fs.readFileSync(tempThumb);
+  // 封面：截第 1 秒那一帧；截不到（视频不到 1 秒之类，11-09 有一次因为这个降级成了文件）就截第一帧
+  for (const at of ['00:00:01', '00:00:00']) {
+    try {
+      execFileSync('ffmpeg', [
+        '-y',
+        '-ss', at,
+        '-i', videoPath,
+        '-vframes', '1',
+        tempThumb,
+      ], { stdio: 'ignore', timeout: 10000 });
+      if (fs.existsSync(tempThumb) && fs.statSync(tempThumb).size > 0) thumbBuf = fs.readFileSync(tempThumb);
+    } catch (e) {
+      console.warn(`[ffmpeg 截取封面失败（${at}）]:`, e.message);
+    } finally {
+      if (fs.existsSync(tempThumb)) {
+        try { fs.unlinkSync(tempThumb); } catch {}
+      }
     }
-  } catch (e) {
-    console.warn('[ffmpeg 截取封面失败]:', e.message);
-  } finally {
-    if (fs.existsSync(tempThumb)) {
-      try { fs.unlinkSync(tempThumb); } catch {}
-    }
+    if (thumbBuf) break;
   }
 
+  // 降级成文件发的，返回值带上 fallback（原因），消息服务据此如实说一声
   if (!thumbBuf) {
     console.log('[未生成封面图，降级走普通文件卡片通道发送]');
-    return await uploadAndSendWechatFile(toUserId, contextToken, videoPath, config);
+    const sent = await uploadAndSendWechatFile(toUserId, contextToken, videoPath, config, opts);
+    return { ...sent, fallback: '截不到封面图' };
   }
 
   try {
     const videoBuf = fs.readFileSync(videoPath);
     console.log(`[正在上传原生视频本体至微信 CDN]: ${describePath(videoPath)} (${videoBuf.length} 字节)...`);
-    const videoUp = await uploadBufferToCdn(videoBuf, 2, toUserId, config); // 2 = MEDIA_VIDEO
+    const videoUp = await uploadBufferToCdn(videoBuf, 2, toUserId, config); // 2 = MEDIA_VIDEO（没传上会重试）
 
     console.log(`[正在上传原生视频封面图至微信 CDN]: (${thumbBuf.length} 字节)...`);
     const thumbUp = await uploadBufferToCdn(thumbBuf, 1, toUserId, config); // 1 = IMAGE
@@ -895,6 +801,7 @@ export async function uploadAndSendWechatVideo(toUserId, contextToken, videoPath
     // 回复凭证全用满了：换成文件发也一样会被拒，直接报出去
     if (isPrepareFailed(err)) throw err;
     console.warn(`[原生视频消息发送异常，安全降级为文件卡片发送]:`, err.message);
-    return await uploadAndSendWechatFile(toUserId, contextToken, videoPath, config, opts);
+    const sent = await uploadAndSendWechatFile(toUserId, contextToken, videoPath, config, opts);
+    return { ...sent, fallback: err.message };
   }
 }
