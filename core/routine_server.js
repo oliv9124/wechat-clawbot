@@ -42,6 +42,10 @@ import { parseCredentialCommand, saveSkillCredential, credentialHelp, isInstalle
 import { raiseAlert } from './alert.js';
 import { cleanupOldSessions, referencedIds, describeCleanup } from './session_cleanup.js';
 import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, agyContextTokens, recordAgentResult } from './agent_health.js';
+import {
+  menuPick, listAgyModels, accountDefaultModel, chosenModel, brainMenuItems, brainMenuText, modelMenuItems, modelMenuText,
+  isModelSelectionError, modelUnavailableNotice, modelErrorHint,
+} from './brain_menu.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const botRoot = process.cwd();
@@ -339,7 +343,8 @@ try {
 } catch {}
 
 // ---------- GPT 大脑（Codex CLI） ----------
-// config.json 里 codex_brain:true 的机器人可以把消息交给 Codex：「用 GPT …」只这一条，「切到 GPT」之后都用，「切回来」换回 Antigravity。
+// config.json 里 codex_brain:true 的机器人可以把消息交给 Codex：「用 GPT …」（后面跟着要问的话）只这一条，
+// 单独发「用gpt」「切到 GPT」之后都用，「切回来」「用agy」换回 Antigravity。「大脑」「模型」两个菜单和 Antigravity 选模型见 brain_menu.js。
 // Codex 用这个机器人自己的登录（CLAWBOT_CODEX_HOME，一个机器人一份，不复制别人的）；会话 ID 和 Antigravity 的分开记（运行状态 codex）。
 // 用哪个 Codex：服务里用 CLAWBOT_CODEX_EXE 指定；不指定就用 PATH 里的 codex
 const CODEX_EXE = process.env.CLAWBOT_CODEX_EXE || 'codex';
@@ -354,12 +359,27 @@ function parseBrainCommand(text) {
   // 命令前面先叫一声名字也认：「小助，切到 GPT」「阿福 用 GPT 写首诗」（去掉开头 6 个字以内的称呼和后面的逗号、冒号或空格再判断）
   const named = raw.replace(/^[@＠]?[^\s，,：:。.!！?？]{1,6}[，,：:\s]+/, '');
   for (const t of named === raw ? [raw] : [raw, named]) {
-    if (/^(切到|切换到|换成|改用)\s*(gpt|codex)(\s*模式)?[。.!！]?$/i.test(t)) return { kind: 'on' };
-    if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?)[。.!！]?$/i.test(t)) return { kind: 'off' };
+    // 单独发的指令不管大小写和末尾的标点（「用GPT。」「切回来！」）
+    const c = t.replace(/[\s。.!！~～?？]+$/u, '');
+    if (/^(大脑|查大脑|看大脑|切换大脑)$/.test(c)) return { kind: 'brain_menu' };
+    if (/^(模型|查模型|看模型|切模型|换模型|有哪些模型)$/.test(c)) return { kind: 'model_menu' };
+    // 大脑和模型一起回到默认
+    if (/^(切回默认|恢复默认|恢复默认模型|用默认模型)$/.test(c)) return { kind: 'reset' };
+    if (/^(((切到|切换到|换成|改用)\s*(gpt|codex)|(用|换|调用|切|切换|开)\s*gpt)(\s*模式)?|gpt\s*模式)$/i.test(c)) return { kind: 'on' };
+    if (/^(切回来|切回去|换回来|退出\s*gpt(\s*模式)?|(用|换|切|切到|切换|切换到|换成|改用)\s*agy|用默认大脑)$/i.test(c)) return { kind: 'off' };
     if (/^(查(一下|下)?|看(一下|下)?)?\s*gpt\s*的?\s*(额度|用量|余量|配额)(还剩多少|还有多少|剩多少|怎么样|多少)?[？?。.!！]?$/i.test(t)) return { kind: 'quota' };
-    if (/^(用|让|请|叫)?\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
+    // 关键词后面还跟着要问的话（「用 gpt 帮我写段脚本」「切到gpt 写首诗」）：只这一条交给 GPT，默认的大脑不变
+    if (/^(用|让|请|叫|调用|切换到|切换|切到|切|换成|换|改用|开)?\s*gpt\s*[，,:：]?\s*\S/i.test(t)) return { kind: 'once' };
   }
   return null;
+}
+// 刚弹过「大脑」「模型」菜单、这条又是单独一个数字：算选菜单（不等后面的消息、不合并）
+function isMenuPick(text) {
+  try {
+    return Boolean(menuPick(text, loadRuntimeState('brain')));
+  } catch {
+    return false;
+  }
 }
 // 技能清单写进给 Codex 的提示词（它不会自己去 .agents/skills 里找）
 function codexSkillsIndex() {
@@ -684,14 +704,18 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
 function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFile = null) {
   const tagsPath = tagsFile || newReplyTagsFile();
   const startedAt = Date.now();
+  // 主人在「模型」菜单里给这个号选了模型：这次用它（--model，只管微信聊天）；没选就跟着账号设置走
+  let model = null;
+  try { model = chosenModel(loadRuntimeState('brain')); } catch {}
   return new Promise((resolve, reject) => {
     const args = ['--dangerously-skip-permissions'];
+    if (model) args.push('--model', model.id);
     if (conversationId) {
       args.push('--conversation', conversationId);
     }
     args.push(...AGY_STREAM_ARGS);
 
-    console.log(`[调用 agy]: 会话ID=${conversationId || '(全新会话)'}`);
+    console.log(`[调用 agy]: 会话ID=${conversationId || '(全新会话)'}${model ? `，模型=${model.id}` : ''}`);
 
     activeAgents++;
     const child = execFile(
@@ -709,6 +733,15 @@ function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFil
         // 退出码为 0 但输出里 status 是 ERROR 的也算失败（比如登录失效）；没有 result 事件也算失败
         const outcome = agyOutcome(error, stdout, stderr);
         if (!outcome.ok) {
+          // 选的模型 agy 不认（下线了、这个号没有）：换新会话重试也一样，直接告诉主人怎么换回默认
+          if (model && isModelSelectionError(`${stderr}\n${outcome.reason || ''}`)) {
+            console.error(`[agy] 选的模型 ${model.id} 用不了（agy 不认这个模型）`);
+            const err = new Error(`Agent processing failed: 模型 ${model.id} 用不了`);
+            err.agentFailure = 'model';
+            err.agyModel = model;
+            err.tags = tags;
+            return reject(err);
+          }
           // 会话本身接不上才值得换新会话重试；登录失效、超时，重试也一样失败，只会让用户多等
           if (conversationId && outcome.kind === 'error') {
             console.warn(`[agy] 会话 ${conversationId} 恢复失败，自动创建全新会话重试...`);
@@ -726,6 +759,7 @@ function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFil
           const err = new Error(`Agent processing failed: ${detail}`);
           err.agentFailure = outcome.kind;
           err.tags = tags;
+          if (model) err.agyModel = model;
           return reject(err);
         }
 
@@ -1269,6 +1303,91 @@ function loadBotMemory(messageText = '') {
   return result;
 }
 
+// ---------- 大脑和模型的指令（程序直接回，不经过智能体） ----------
+// 「大脑」菜单里 GPT 那一行：开着没有、额度怎么样
+function codexMenuNote() {
+  const empty = codexQuotaExhausted();
+  if (empty) return `额度用完了，${bjWhen(empty.resets_at)} 恢复`;
+  const w = loadRuntimeState('codex_quota').secondary;
+  return w && Number(w.resets_at) * 1000 > Date.now() ? `已开启；本周额度用了 ${quotaPct(w)}%` : '已开启';
+}
+// 用着自己选的模型又出了错（登录的问题除外）：报错后面告诉主人怎么一键换回默认
+function withModelHint(text, err) {
+  return err?.agyModel && err.agentFailure !== 'auth' ? `${text}\n${modelErrorHint(err.agyModel.name)}` : text;
+}
+// 「切到 GPT」「切回来」「切回默认」「GPT 额度」「大脑」「模型」和菜单里回的序号：返回要回给主人的话。
+// 选了什么都记在这个机器人自己的 brain.json（各号各管各的，重启不丢）
+async function brainCommandReply(cmd, pick, config) {
+  const now = Date.now();
+  const st = loadRuntimeState('brain');
+  const chosen = chosenModel(st);
+  const defaultName = accountDefaultModel();
+  if (pick && !pick.item) {
+    console.log(`[菜单] 回了 ${pick.n}，菜单里没有这一项`);
+    return `菜单里没有 ${pick.n}，回 1–${pick.menu.items.length} 里的数字（不换了就说别的）。`;
+  }
+  // 选过了，菜单马上作废
+  if (pick) saveRuntimeState('brain', { menu: null });
+  const noCodex = '这个号没开 GPT 大脑，要用的话请管理员开一下。';
+  const toCodex = () => {
+    if (!config.codex_brain) return noCodex;
+    const empty = codexQuotaExhausted();
+    if (empty) {
+      console.log('[切换大脑] GPT 额度用完了，没切');
+      return `GPT 的额度用完了，${bjWhen(empty.resets_at)} 恢复，先接着用默认的大脑。`;
+    }
+    saveRuntimeState('brain', { mode: 'codex', changed_at: now, last_used_at: now });
+    console.log('[切换大脑] GPT（Codex）');
+    return '好，接下来用 GPT 回答（说「切回来」换回）。';
+  };
+  const toAgy = () => {
+    saveRuntimeState('brain', { mode: 'agy', changed_at: now });
+    console.log('[切换大脑] Antigravity');
+    return `好，换回来了，接下来用默认的大脑回答${chosen ? `（模型：${chosen.name}）` : ''}。`;
+  };
+  const leftCodex = st.mode === 'codex' && config.codex_brain ? '也从 GPT 切回了 Antigravity。' : '';
+  const resetAll = (fromMenu) => {
+    saveRuntimeState('brain', { mode: 'agy', changed_at: now, agy_model: null, agy_model_name: null });
+    console.log('[切换大脑] 大脑和模型都恢复默认');
+    const def = defaultName ? `（${defaultName}）` : '';
+    return fromMenu
+      ? `已恢复默认模型${def}，下一条消息生效。${leftCodex}`
+      : `好，大脑和模型都恢复默认了：接下来用 Antigravity、账号设置里的模型${def}回答。`;
+  };
+  if (pick?.menu.kind === 'brain') return pick.item.brain === 'codex' ? toCodex() : toAgy();
+  if (pick) {
+    if (pick.item.reset) return resetAll(true);
+    // 选了模型就用 Antigravity（GPT 模式下选也一样）
+    saveRuntimeState('brain', { mode: 'agy', changed_at: now, agy_model: pick.item.id, agy_model_name: pick.item.name });
+    console.log(`[切换模型] ${pick.item.id}`);
+    return `已切换到 ${pick.n}. ${pick.item.name}，下一条消息生效。${leftCodex}`;
+  }
+  if (cmd.kind === 'on') return toCodex();
+  if (cmd.kind === 'off') return toAgy();
+  if (cmd.kind === 'reset') return resetAll(false);
+  if (cmd.kind === 'quota') {
+    if (!config.codex_brain) return noCodex;
+    console.log('[GPT 额度] 直接回记下的额度，不调用 GPT');
+    return codexQuotaReport(st.mode);
+  }
+  if (cmd.kind === 'brain_menu') {
+    saveRuntimeState('brain', { menu: { kind: 'brain', at: now, items: brainMenuItems() } });
+    console.log('[大脑菜单] 已发');
+    const modelName = chosen ? chosen.name : defaultName ? `${defaultName}，账号默认` : '账号默认';
+    return brainMenuText({ mode: st.mode, codexEnabled: Boolean(config.codex_brain), codexNote: config.codex_brain ? codexMenuNote() : '', modelName });
+  }
+  // 「模型」：用这个号自己的账号拉一次 agy 的模型列表（各号看到的可能不一样）
+  const res = await listAgyModels({ cwd: botRoot, env: process.env });
+  if (!res.ok) {
+    saveRuntimeState('brain', { menu: null });
+    console.warn(`[模型菜单] 没拿到模型列表：agy ${res.why}${res.detail ? `（${res.detail}）` : ''}`);
+    return `暂时拿不到模型列表（agy ${res.why}），过一会儿再试。现在用的是${chosen ? `「${chosen.name}」` : `账号默认的模型${defaultName ? `「${defaultName}」` : ''}`}。`;
+  }
+  saveRuntimeState('brain', { menu: { kind: 'model', at: now, items: modelMenuItems(res.models) } });
+  console.log(`[模型菜单] 已发：${res.models.length} 个${res.hidden ? `（另有 ${res.hidden} 个 Claude 不列）` : ''}`);
+  return modelMenuText({ models: res.models, chosen, defaultName });
+}
+
 /**
  * 处理一条消息。返回 null 表示已处理完；任务转入后台时返回 { background }，background 在后台结束时 resolve。
  * （不能直接返回 Promise：async 函数会自动等它完成，调用方就被卡到后台任务结束。）
@@ -1286,6 +1405,17 @@ async function handleWechatTask(task) {
   console.log(`\n================== [微信消息开始处理] ==================`);
   console.log(`用户ID: ${from_user_id}`);
   console.log(`消息内容: ${describeText(message_text)}`);
+
+  // 「大脑」「模型」菜单弹出以后说了别的（不是回序号、也不是再查菜单），菜单就作废：之后再发数字照常交给 AI
+  const brainCmd = parseBrainCommand(message_text);
+  let menuChoice = null;
+  try {
+    const brainState = loadRuntimeState('brain');
+    menuChoice = brainCmd ? null : menuPick(message_text, brainState);
+    if (brainState.menu && !menuChoice && brainCmd?.kind !== 'brain_menu' && brainCmd?.kind !== 'model_menu') saveRuntimeState('brain', { menu: null });
+  } catch (e) {
+    console.warn(`[菜单] 运行状态读写失败：${e.message}`);
+  }
 
   // 「设置凭证 B站 <cookie>」：程序直接存进这个机器人自己的 data/skills/<技能>/cookie.txt，不经过智能体；
   // 凭证不写进聊天日志（只记一句设了哪个），免得被整理进记忆、留在版本记录里
@@ -1438,31 +1568,18 @@ async function handleWechatTask(task) {
   }
 
   // 1. 发送输入中状态
-  // GPT 大脑：「切到 GPT」「切回来」程序直接切；「用 GPT …」只这一条交给 Codex（只有 config.json 开了 codex_brain 的机器人认）
+  // 大脑和模型：「切到 GPT」「切回来」「切回默认」「GPT 额度」「大脑」「模型」和菜单里回的序号，程序直接处理，不经过智能体
   let brain = 'agy';
+  if (menuChoice || (brainCmd && brainCmd.kind !== 'once')) {
+    // （「微信接收」前面已经记过了，这里只记回复）
+    const reply = await brainCommandReply(brainCmd, menuChoice, config);
+    appendLog(`AI回复(实时): ${reply}`);
+    if (context_token) await sendWechatReply(from_user_id, context_token, reply, config);
+    console.log(`====================================================\n`);
+    return null;
+  }
+  // GPT 大脑：「用 GPT …」只这一条交给 Codex，切到 GPT 以后都交给它（只有 config.json 开了 codex_brain 的机器人认）
   if (config.codex_brain) {
-    const cmd = parseBrainCommand(message_text);
-    if (cmd?.kind === 'on' || cmd?.kind === 'off' || cmd?.kind === 'quota') {
-      // （「微信接收」前面已经记过了，这里只记回复）
-      let reply;
-      const empty = cmd.kind === 'on' ? codexQuotaExhausted() : null;
-      if (cmd.kind === 'quota') {
-        reply = codexQuotaReport(loadRuntimeState('brain').mode);
-        console.log('[GPT 额度] 直接回记下的额度，不调用 GPT');
-      } else if (empty) {
-        reply = `GPT 的额度用完了，${bjWhen(empty.resets_at)} 恢复，先接着用默认的大脑。`;
-        console.log('[切换大脑] GPT 额度用完了，没切');
-      } else {
-        const now = Date.now();
-        saveRuntimeState('brain', cmd.kind === 'on' ? { mode: 'codex', changed_at: now, last_used_at: now } : { mode: 'agy', changed_at: now });
-        reply = cmd.kind === 'on' ? '好，接下来用 GPT 回答（说「切回来」换回）。' : '好，换回来了，接下来用默认的大脑回答。';
-        console.log(`[切换大脑] ${cmd.kind === 'on' ? 'GPT（Codex）' : 'Antigravity'}`);
-      }
-      appendLog(`AI回复(实时): ${reply}`);
-      if (context_token) await sendWechatReply(from_user_id, context_token, reply, config);
-      console.log(`====================================================\n`);
-      return null;
-    }
     const parts = Array.isArray(task.parts) && task.parts.length ? task.parts : [message_text];
     if (parts.some((p) => parseBrainCommand(p)?.kind === 'once') || loadRuntimeState('brain').mode === 'codex') brain = 'codex';
   }
@@ -1634,9 +1751,11 @@ async function handleWechatTask(task) {
       // 登录失效、到时间上限被停掉时如实说明（监控已经通知主人）；其他错误使用友好转译器脱敏
       plainReply = raceResult.err.agentFailure === 'auth'
         ? agentLoginNotice(botName)
-        : raceResult.err.agentFailure === 'timeout'
-          ? timeoutNotice(userNickname)
-          : formatFriendlyError(raceResult.err, botName, userNickname);
+        : raceResult.err.agentFailure === 'model'
+          ? modelUnavailableNotice(raceResult.err.agyModel?.name || '选的模型')
+          : withModelHint(raceResult.err.agentFailure === 'timeout'
+            ? timeoutNotice(userNickname)
+            : formatFriendlyError(raceResult.err, botName, userNickname), raceResult.err);
     } else {
       rawReply = raceResult.res.reply;
       plainReply = rawReply;
@@ -1742,9 +1861,11 @@ async function handleWechatTask(task) {
 
           const errorNotice = execErr.agentFailure === 'auth'
             ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`
-            : execErr.agentFailure === 'timeout'
-              ? `🔔 【后台任务执行提醒】\n${timeoutNotice(userNickname)}`
-              : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`;
+            : execErr.agentFailure === 'model'
+              ? `🔔 【后台任务执行提醒】\n${modelUnavailableNotice(execErr.agyModel?.name || '选的模型')}`
+              : withModelHint(execErr.agentFailure === 'timeout'
+                ? `🔔 【后台任务执行提醒】\n${timeoutNotice(userNickname)}`
+                : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`, execErr);
           await deliverResultToWechat(toUser, targetToken, withReplyTags(execErr.tags, errorNotice), '', true, message_text);
         } catch (postErr) {
           console.error(`[后台异常通知发送失败]:`, postErr.message);
@@ -1810,6 +1931,7 @@ function isInstantMessage(text) {
   if (STATUS_QUESTION.test(t) && (backgroundTasks.size > 0 || pushRateLimiter.isCoolingDown() > 0)) return true;
   const cmd = parseBrainCommand(t);
   if (cmd && cmd.kind !== 'once') return true;
+  if (isMenuPick(t)) return true;
   try {
     if (parseCredentialCommand(t) || parseMemoryCommand(t)) return true;
   } catch {}
