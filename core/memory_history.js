@@ -1292,7 +1292,11 @@ function digestText(items, since, notes = [], { numbered = true, botName = '' } 
   if (items.length > cap) lines.push(numbered ? `还有 ${items.length - cap} 条，回「记忆改动」看全部。` : `另外还有 ${items.length - cap} 条小改动，就不一一列了。`);
   lines.push(...notes);
   if (!numbered) lines.push(`哪里记得不对，直接告诉${botName}是哪件事就行～`);
-  else lines.push(items.length > 1 ? '哪条记错了，回「撤销 2」这样撤回。' : '记错了的话，回「撤销 1」撤回。');
+  else {
+    // 结尾教怎么撤，也告诉用户能看全部（11-19 加：不然列得下的时候，用户不知道有「记忆改动」）；列不下的上面已经说了，不重复
+    const undo = items.length > 1 ? '哪条记错了，回「撤销 2」这样撤回' : '记错了的话，回「撤销 1」撤回';
+    lines.push(items.length > cap ? `${undo}。` : `${undo}；想看全部，回「记忆改动」。`);
+  }
   return lines.join('\n');
 }
 
@@ -1437,8 +1441,9 @@ export function syncBotDigests({ botsDir = DEFAULT_BOTS_DIR, includeOwner = fals
         }).filter((p) => p.n > 0)
         : [];
       const current = readJson(file);
-      // id 开头的 r2：11-18 换成大白话的复盘以后重新写一份（升级前写好、还没发的那份是旧样子）
-      const id = `r2-${from.slice(0, 10)}-${to.slice(0, 10)}${pointers.map((p) => `-${p.bot}${p.to.slice(0, 6)}`).join('')}`;
+      // id 开头是复盘样子的版本：样子改了就换一个（r2：11-18 换成大白话的复盘；r3：11-19 结尾加"想看全部"），
+      // 升级前写好、还没发的那份马上按新样子重写
+      const id = `r3-${from.slice(0, 10)}-${to.slice(0, 10)}${pointers.map((p) => `-${p.bot}${p.to.slice(0, 6)}`).join('')}`;
       if (current?.id === id) continue;
       const { items } = from === to ? { items: [] } : botItems(botRoot, from);
       if (!items.length && !pointers.length) {
