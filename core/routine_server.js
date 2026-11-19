@@ -45,6 +45,8 @@ import { AGY_STREAM_ARGS, agyInputLine, agyOutcome, agyContextTokens, recordAgen
 import {
   menuPick, listAgyModels, accountDefaultModel, chosenModel, brainMenuItems, brainMenuText, modelMenuItems, modelMenuText,
   isModelSelectionError, modelUnavailableNotice, modelErrorHint,
+  listCodexModels, codexConfig, codexDefaultModel, codexDefaultEffort, chosenCodexModel, chosenEffort,
+  codexModelMenuItems, codexModelMenuText, effortMenuItems, effortMenuText, effortName, isCodexModelError,
 } from './brain_menu.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -344,7 +346,8 @@ try {
 
 // ---------- GPT 大脑（Codex CLI） ----------
 // config.json 里 codex_brain:true 的机器人可以把消息交给 Codex：「用 GPT …」（后面跟着要问的话）只这一条，
-// 单独发「用gpt」「切到 GPT」之后都用，「切回来」「用agy」换回 Antigravity。「大脑」「模型」两个菜单和 Antigravity 选模型见 brain_menu.js。
+// 单独发「用gpt」「切到 GPT」之后都用，「切回来」「用agy」换回 Antigravity。
+// 「大脑」「模型」「GPT 模型」「agy 模型」「推理」菜单（两个大脑各选各的模型，GPT 还能选推理强度）见 brain_menu.js。
 // Codex 用这个机器人自己的登录（CLAWBOT_CODEX_HOME，一个机器人一份，不复制别人的）；会话 ID 和 Antigravity 的分开记（运行状态 codex）。
 // 用哪个 Codex：服务里用 CLAWBOT_CODEX_EXE 指定；不指定就用 PATH 里的 codex
 const CODEX_EXE = process.env.CLAWBOT_CODEX_EXE || 'codex';
@@ -363,6 +366,9 @@ function parseBrainCommand(text) {
     const c = t.replace(/[\s。.!！~～?？]+$/u, '');
     if (/^(大脑|查大脑|看大脑|切换大脑)$/.test(c)) return { kind: 'brain_menu' };
     if (/^(模型|查模型|看模型|切模型|换模型|有哪些模型)$/.test(c)) return { kind: 'model_menu' };
+    if (/^(查|看|切|换)?\s*(gpt|codex)\s*的?\s*模型$|^(gpt|codex)\s*有哪些模型$/i.test(c)) return { kind: 'gpt_model_menu' };
+    if (/^(查|看|切|换)?\s*(agy|antigravity)\s*的?\s*模型$|^(agy|antigravity)\s*有哪些模型$/i.test(c)) return { kind: 'agy_model_menu' };
+    if (/^(查|看|切|换|改)?\s*((gpt|codex)\s*的?\s*)?(推理(强度)?|思考强度)$/i.test(c)) return { kind: 'effort_menu' };
     // 大脑和模型一起回到默认
     if (/^(切回默认|恢复默认|恢复默认模型|用默认模型)$/.test(c)) return { kind: 'reset' };
     if (/^(((切到|切换到|换成|改用)\s*(gpt|codex)|(用|换|调用|切|切换|开)\s*gpt)(\s*模式)?|gpt\s*模式)$/i.test(c)) return { kind: 'on' };
@@ -626,10 +632,19 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
   const tagsPath = tagsFile || newReplyTagsFile();
   try { fs.appendFileSync(tagsPath, 'GPT\n'); } catch {}
   const startedAt = Date.now();
+  // 主人在「GPT 模型」「推理」菜单里给这个号选了模型、推理强度：这次用它们（-m、-c，只管微信聊天）；没选就跟着 Codex 的默认走
+  let model = null;
+  let effort = null;
+  try {
+    const st = loadRuntimeState('brain');
+    model = chosenCodexModel(st);
+    effort = chosenEffort(st);
+  } catch {}
   return new Promise((resolve, reject) => {
     const args = ['exec', ...(threadId ? ['resume'] : []), '--json', '--skip-git-repo-check',
-      '--dangerously-bypass-approvals-and-sandbox', ...(threadId ? [threadId] : []), '-'];
-    console.log(`[调用 Codex]: 会话ID=${threadId || '(全新会话)'}`);
+      '--dangerously-bypass-approvals-and-sandbox', ...(model ? ['-m', model.id] : []),
+      ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : []), ...(threadId ? [threadId] : []), '-'];
+    console.log(`[调用 Codex]: 会话ID=${threadId || '(全新会话)'}${model ? `，模型=${model.id}` : ''}${effort ? `，推理=${effort}` : ''}`);
     activeAgents++;
     const child = execFile(CODEX_EXE, args, {
       cwd: botRoot,
@@ -655,6 +670,15 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
       const reply = String(texts[texts.length - 1] || '').trim();
       if (error || failure || !reply) {
         const tail = String(stderr || '').trim().slice(-300);
+        // 选的 GPT 模型 Codex 不认（下线了、这个账号用不了）：换新会话重试也一样，直接告诉主人怎么换回默认
+        if (model && isCodexModelError(`${failure} ${tail}`)) {
+          console.error(`[Codex] 选的模型 ${model.id} 用不了（Codex 不认这个模型）`);
+          const err = new Error(`Codex processing failed: 模型 ${model.id} 用不了`);
+          err.agentFailure = 'model';
+          err.chosenModel = model;
+          err.tags = tags;
+          return reject(err);
+        }
         const kind = error?.killed ? 'timeout'
           : /log ?in|401|unauthori[sz]ed|refresh.?token/i.test(`${tail} ${failure}`) ? 'auth'
             : CODEX_QUOTA_ERROR.test(`${tail} ${failure}`) ? 'quota' : 'error';
@@ -670,6 +694,7 @@ function runCodex(promptText, threadId = null, freshPrompt = null, tagsFile = nu
         const err = new Error(`Codex processing failed: ${failure || tail || 'no reply'}`);
         err.agentFailure = kind;
         err.tags = tags;
+        if (model) err.chosenModel = model;
         return reject(err);
       }
       // 回复里没带图、这一轮却画了图（GPT 自带工具的图存在它自己的目录，系统发不出去）：取最新一张放进机器人目录，自动发
@@ -738,7 +763,7 @@ function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFil
             console.error(`[agy] 选的模型 ${model.id} 用不了（agy 不认这个模型）`);
             const err = new Error(`Agent processing failed: 模型 ${model.id} 用不了`);
             err.agentFailure = 'model';
-            err.agyModel = model;
+            err.chosenModel = model;
             err.tags = tags;
             return reject(err);
           }
@@ -759,7 +784,7 @@ function runAgent(promptText, conversationId = null, freshPrompt = null, tagsFil
           const err = new Error(`Agent processing failed: ${detail}`);
           err.agentFailure = outcome.kind;
           err.tags = tags;
-          if (model) err.agyModel = model;
+          if (model) err.chosenModel = model;
           return reject(err);
         }
 
@@ -1304,24 +1329,29 @@ function loadBotMemory(messageText = '') {
 }
 
 // ---------- 大脑和模型的指令（程序直接回，不经过智能体） ----------
-// 「大脑」菜单里 GPT 那一行：开着没有、额度怎么样
-function codexMenuNote() {
+// 「大脑」菜单里 GPT 那一行的额度：用完了说什么时候恢复，没用完说本周用了多少
+function codexQuotaNote() {
   const empty = codexQuotaExhausted();
   if (empty) return `额度用完了，${bjWhen(empty.resets_at)} 恢复`;
   const w = loadRuntimeState('codex_quota').secondary;
-  return w && Number(w.resets_at) * 1000 > Date.now() ? `已开启；本周额度用了 ${quotaPct(w)}%` : '已开启';
+  return w && Number(w.resets_at) * 1000 > Date.now() ? `本周额度用了 ${quotaPct(w)}%` : '';
 }
 // 用着自己选的模型又出了错（登录的问题除外）：报错后面告诉主人怎么一键换回默认
 function withModelHint(text, err) {
-  return err?.agyModel && err.agentFailure !== 'auth' ? `${text}\n${modelErrorHint(err.agyModel.name)}` : text;
+  return err?.chosenModel && err.agentFailure !== 'auth' ? `${text}\n${modelErrorHint(err.chosenModel.name)}` : text;
 }
-// 「切到 GPT」「切回来」「切回默认」「GPT 额度」「大脑」「模型」和菜单里回的序号：返回要回给主人的话。
+// 这个号的 GPT 模型目录（用它自己的 GPT 登录拉，大约 1 秒）
+const codexCatalog = () => listCodexModels({ exe: CODEX_EXE, cwd: botRoot, env: { ...process.env, CODEX_HOME: CODEX_HOME_DIR } });
+// 「切到 GPT」「切回来」「切回默认」「GPT 额度」「大脑」「模型」「GPT 模型」「推理」和菜单里回的序号：返回要回给主人的话。
 // 选了什么都记在这个机器人自己的 brain.json（各号各管各的，重启不丢）
 async function brainCommandReply(cmd, pick, config) {
   const now = Date.now();
   const st = loadRuntimeState('brain');
   const chosen = chosenModel(st);
+  const gptChosen = chosenCodexModel(st);
+  const gptEffort = chosenEffort(st);
   const defaultName = accountDefaultModel();
+  const codexCfg = codexConfig(CODEX_HOME_DIR);
   if (pick && !pick.item) {
     console.log(`[菜单] 回了 ${pick.n}，菜单里没有这一项`);
     return `菜单里没有 ${pick.n}，回 1–${pick.menu.items.length} 里的数字（不换了就说别的）。`;
@@ -1329,13 +1359,17 @@ async function brainCommandReply(cmd, pick, config) {
   // 选过了，菜单马上作废
   if (pick) saveRuntimeState('brain', { menu: null });
   const noCodex = '这个号没开 GPT 大脑，要用的话请管理员开一下。';
-  const toCodex = () => {
+  // 要用 GPT（切到 GPT、选 GPT 的模型或推理强度）之前先看能不能用：没开、额度用完了就说一声，什么都不换
+  const codexBlocked = () => {
     if (!config.codex_brain) return noCodex;
     const empty = codexQuotaExhausted();
-    if (empty) {
-      console.log('[切换大脑] GPT 额度用完了，没切');
-      return `GPT 的额度用完了，${bjWhen(empty.resets_at)} 恢复，先接着用默认的大脑。`;
-    }
+    if (!empty) return '';
+    console.log('[切换大脑] GPT 额度用完了，没切');
+    return `GPT 的额度用完了，${bjWhen(empty.resets_at)} 恢复，先接着用默认的大脑。`;
+  };
+  const toCodex = () => {
+    const blocked = codexBlocked();
+    if (blocked) return blocked;
     saveRuntimeState('brain', { mode: 'codex', changed_at: now, last_used_at: now });
     console.log('[切换大脑] GPT（Codex）');
     return '好，接下来用 GPT 回答（说「切回来」换回）。';
@@ -1345,26 +1379,55 @@ async function brainCommandReply(cmd, pick, config) {
     console.log('[切换大脑] Antigravity');
     return `好，换回来了，接下来用默认的大脑回答${chosen ? `（模型：${chosen.name}）` : ''}。`;
   };
-  const leftCodex = st.mode === 'codex' && config.codex_brain ? '也从 GPT 切回了 Antigravity。' : '';
-  const resetAll = (fromMenu) => {
-    saveRuntimeState('brain', { mode: 'agy', changed_at: now, agy_model: null, agy_model_name: null });
-    console.log('[切换大脑] 大脑和模型都恢复默认');
-    const def = defaultName ? `（${defaultName}）` : '';
-    return fromMenu
-      ? `已恢复默认模型${def}，下一条消息生效。${leftCodex}`
-      : `好，大脑和模型都恢复默认了：接下来用 Antigravity、账号设置里的模型${def}回答。`;
-  };
+  const usingCodex = st.mode === 'codex' && Boolean(config.codex_brain);
+  const leftCodex = usingCodex ? '也从 GPT 切回了 Antigravity。' : '';
+  const joinedCodex = usingCodex ? '' : '也切到了 GPT。';
   if (pick?.menu.kind === 'brain') return pick.item.brain === 'codex' ? toCodex() : toAgy();
+  if (pick?.menu.kind === 'effort' || pick?.menu.kind === 'gpt_model') {
+    const blocked = codexBlocked();
+    if (blocked) return blocked;
+    if (pick.menu.kind === 'effort') {
+      const e = pick.item.effort;
+      // 选的就是默认那一档：不另外记（以后默认变了跟着变）
+      saveRuntimeState('brain', { mode: 'codex', changed_at: now, last_used_at: now, gpt_effort: e === pick.menu.default_effort ? null : e });
+      console.log(`[切换推理强度] ${e}`);
+      return `GPT 的推理强度改成「${effortName(e)}」，下一条消息生效。${joinedCodex}`;
+    }
+    // GPT 的模型（或恢复默认）：现在选的推理强度新模型没有这一档，就回到默认
+    const item = pick.item;
+    const levels = Array.isArray(item.levels) ? item.levels : [];
+    const dropEffort = Boolean(gptEffort && levels.length && !levels.includes(gptEffort));
+    saveRuntimeState('brain', {
+      mode: 'codex', changed_at: now, last_used_at: now,
+      gpt_model: item.reset ? null : item.id, gpt_model_name: item.reset ? null : item.name,
+      ...(dropEffort ? { gpt_effort: null } : {}),
+    });
+    console.log(`[切换 GPT 模型] ${item.reset ? '恢复默认' : item.id}`);
+    const what = item.reset ? `已恢复 GPT 的默认模型${pick.menu.default_name ? `（${pick.menu.default_name}）` : ''}` : `已切换到 ${pick.n}. ${item.name}`;
+    const fallback = codexCfg.effort || item.defaultLevel;
+    const effortNote = dropEffort ? `这个模型没有「${effortName(gptEffort)}」这一档，推理强度回到默认${fallback ? `的「${effortName(fallback)}」` : ''}。` : '';
+    return `${what}，下一条消息生效。${joinedCodex}${effortNote}`;
+  }
   if (pick) {
-    if (pick.item.reset) return resetAll(true);
-    // 选了模型就用 Antigravity（GPT 模式下选也一样）
+    if (pick.item.reset) {
+      saveRuntimeState('brain', { mode: 'agy', changed_at: now, agy_model: null, agy_model_name: null });
+      console.log('[切换模型] Antigravity 恢复默认');
+      return `已恢复默认模型${defaultName ? `（${defaultName}）` : ''}，下一条消息生效。${leftCodex}`;
+    }
+    // 选了 Antigravity 的模型就用 Antigravity（GPT 模式下选也一样）
     saveRuntimeState('brain', { mode: 'agy', changed_at: now, agy_model: pick.item.id, agy_model_name: pick.item.name });
     console.log(`[切换模型] ${pick.item.id}`);
     return `已切换到 ${pick.n}. ${pick.item.name}，下一条消息生效。${leftCodex}`;
   }
   if (cmd.kind === 'on') return toCodex();
   if (cmd.kind === 'off') return toAgy();
-  if (cmd.kind === 'reset') return resetAll(false);
+  if (cmd.kind === 'reset') {
+    // 「切回默认」：大脑回到 Antigravity，两个大脑的模型（和 GPT 的推理强度）都恢复默认
+    saveRuntimeState('brain', { mode: 'agy', changed_at: now, agy_model: null, agy_model_name: null, gpt_model: null, gpt_model_name: null, gpt_effort: null });
+    console.log('[切换大脑] 大脑和模型都恢复默认');
+    const gptToo = gptChosen || gptEffort ? 'GPT 的模型和推理强度也恢复默认了。' : '';
+    return `好，大脑和模型都恢复默认了：接下来用 Antigravity、账号设置里的模型${defaultName ? `（${defaultName}）` : ''}回答。${gptToo}`;
+  }
   if (cmd.kind === 'quota') {
     if (!config.codex_brain) return noCodex;
     console.log('[GPT 额度] 直接回记下的额度，不调用 GPT');
@@ -1372,11 +1435,45 @@ async function brainCommandReply(cmd, pick, config) {
   }
   if (cmd.kind === 'brain_menu') {
     saveRuntimeState('brain', { menu: { kind: 'brain', at: now, items: brainMenuItems() } });
-    console.log('[大脑菜单] 已发');
     const modelName = chosen ? chosen.name : defaultName ? `${defaultName}，账号默认` : '账号默认';
-    return brainMenuText({ mode: st.mode, codexEnabled: Boolean(config.codex_brain), codexNote: config.codex_brain ? codexMenuNote() : '', modelName });
+    let codexNote = '';
+    if (config.codex_brain) {
+      // 没选过 GPT 模型：拉一次模型目录，看默认是哪个
+      const cat = gptChosen ? null : await codexCatalog();
+      const def = cat?.ok ? codexDefaultModel(cat.models, codexCfg) : null;
+      const eff = gptEffort || codexDefaultEffort(def, codexCfg);
+      codexNote = [
+        `模型：${gptChosen ? gptChosen.name : def ? `${def.name}，默认` : '默认'}`,
+        eff ? `推理：${effortName(eff)}${gptEffort ? '' : '，默认'}` : '',
+        codexQuotaNote(),
+      ].filter(Boolean).join('；');
+    }
+    console.log('[大脑菜单] 已发');
+    return brainMenuText({ mode: st.mode, codexEnabled: Boolean(config.codex_brain), codexNote, modelName });
   }
-  // 「模型」：用这个号自己的账号拉一次 agy 的模型列表（各号看到的可能不一样）
+  // 「GPT 模型」「推理」，以及用着 GPT 时的「模型」：用这个号自己的 GPT 登录拉一次模型目录
+  if (cmd.kind === 'gpt_model_menu' || cmd.kind === 'effort_menu' || (cmd.kind === 'model_menu' && usingCodex)) {
+    if (!config.codex_brain) return noCodex;
+    const cat = await codexCatalog();
+    if (!cat.ok) {
+      saveRuntimeState('brain', { menu: null });
+      console.warn(`[GPT 菜单] 没拿到模型目录：Codex ${cat.why}${cat.detail ? `（${cat.detail}）` : ''}`);
+      return `暂时拿不到 GPT 的模型目录（Codex ${cat.why}），过一会儿再试。`;
+    }
+    const def = codexDefaultModel(cat.models, codexCfg);
+    if (cmd.kind === 'effort_menu') {
+      const cur = (gptChosen && cat.models.find((m) => m.id === gptChosen.id)) || def;
+      const levels = cur?.levels?.length ? cur.levels : ['low', 'medium', 'high', 'xhigh', 'max'];
+      const defaultEffort = codexDefaultEffort(cur, codexCfg);
+      saveRuntimeState('brain', { menu: { kind: 'effort', at: now, items: effortMenuItems(levels), default_effort: defaultEffort } });
+      console.log(`[推理菜单] 已发：${levels.length} 档`);
+      return effortMenuText({ levels, chosen: gptEffort, defaultEffort, modelName: cur?.name || gptChosen?.name || '' });
+    }
+    saveRuntimeState('brain', { menu: { kind: 'gpt_model', at: now, items: codexModelMenuItems(cat.models, def), default_name: def?.name || '' } });
+    console.log(`[GPT 模型菜单] 已发：${cat.models.length} 个`);
+    return codexModelMenuText({ models: cat.models, chosen: gptChosen, def });
+  }
+  // 「模型」（用着 Antigravity 时）「agy 模型」：用这个号自己的账号拉一次 agy 的模型列表（各号看到的可能不一样）
   const res = await listAgyModels({ cwd: botRoot, env: process.env });
   if (!res.ok) {
     saveRuntimeState('brain', { menu: null });
@@ -1412,7 +1509,7 @@ async function handleWechatTask(task) {
   try {
     const brainState = loadRuntimeState('brain');
     menuChoice = brainCmd ? null : menuPick(message_text, brainState);
-    if (brainState.menu && !menuChoice && brainCmd?.kind !== 'brain_menu' && brainCmd?.kind !== 'model_menu') saveRuntimeState('brain', { menu: null });
+    if (brainState.menu && !menuChoice && !/_menu$/.test(brainCmd?.kind || '')) saveRuntimeState('brain', { menu: null });
   } catch (e) {
     console.warn(`[菜单] 运行状态读写失败：${e.message}`);
   }
@@ -1752,7 +1849,7 @@ async function handleWechatTask(task) {
       plainReply = raceResult.err.agentFailure === 'auth'
         ? agentLoginNotice(botName)
         : raceResult.err.agentFailure === 'model'
-          ? modelUnavailableNotice(raceResult.err.agyModel?.name || '选的模型')
+          ? modelUnavailableNotice(raceResult.err.chosenModel?.name || '选的模型')
           : withModelHint(raceResult.err.agentFailure === 'timeout'
             ? timeoutNotice(userNickname)
             : formatFriendlyError(raceResult.err, botName, userNickname), raceResult.err);
@@ -1862,7 +1959,7 @@ async function handleWechatTask(task) {
           const errorNotice = execErr.agentFailure === 'auth'
             ? `🔔 【后台任务执行提醒】\n${userNickname}，${agentLoginNotice(botName)}`
             : execErr.agentFailure === 'model'
-              ? `🔔 【后台任务执行提醒】\n${modelUnavailableNotice(execErr.agyModel?.name || '选的模型')}`
+              ? `🔔 【后台任务执行提醒】\n${modelUnavailableNotice(execErr.chosenModel?.name || '选的模型')}`
               : withModelHint(execErr.agentFailure === 'timeout'
                 ? `🔔 【后台任务执行提醒】\n${timeoutNotice(userNickname)}`
                 : `🔔 【后台任务执行提醒】\n${formatFriendlyError(execErr, botName, userNickname)}`, execErr);
