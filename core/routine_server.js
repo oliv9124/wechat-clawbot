@@ -32,6 +32,7 @@ import {
   failInbox,
   requeueProcessing,
   messageIdFromFileName,
+  hasMediaDownloading,
 } from './inbox.js';
 import {
   RESET_MARKER, isResetEntry, loadTopicsConfig, capForLoading, charCount, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS,
@@ -2018,6 +2019,8 @@ const MERGE_TEXT_WAIT_MS = Number(process.env.ROUTINE_MERGE_TEXT_WAIT_MS ?? 2000
 const MERGE_MEDIA_WAIT_MS = Number(process.env.ROUTINE_MERGE_MEDIA_WAIT_MS ?? 8000);
 const MERGE_MAX_WAIT_MS = 20_000;
 const MERGE_MAX_MESSAGES = 10;
+const MERGE_MEDIA_DOWNLOAD_POLL_MS = 400;
+const MERGE_MEDIA_DOWNLOAD_MAX_AGE_MS = 30_000;
 const RESET_COMMAND = /^\s*(\/reset|\/clear|\/new|新会话|重置会话|清除记忆)\s*$/i;
 const UPGRADE_COMMAND = /^\s*(\/upgrade|\/update|更新系统|系统更新|升级系统|检查更新|更新机器人|升级机器人|机器人更新)\s*$/i;
 // forwarder 收到只有图片的消息时写成这样（见 wechat_forwarder.js）
@@ -2060,8 +2063,13 @@ function pickBatch(pending) {
   const newest = group.reduce((a, b) => (b.at >= a.at ? b : a));
   const oldest = Math.min(...group.map((g) => g.at));
   const wait = group.every((g) => isMediaOnly(g.task.message_text)) ? MERGE_MEDIA_WAIT_MS : MERGE_TEXT_WAIT_MS;
-  const waitMs = group.length >= MERGE_MAX_MESSAGES ? 0 : Math.max(0, Math.min(newest.at + wait, oldest + MERGE_MAX_WAIT_MS) - Date.now());
-  return { files: group.map((g) => g.fileName), waitMs, newest };
+  const now = Date.now();
+  const baseWaitMs = group.length >= MERGE_MAX_MESSAGES ? 0 : Math.max(0, Math.min(newest.at + wait, oldest + MERGE_MAX_WAIT_MS) - now);
+  const maxRemainMs = Math.max(0, oldest + MERGE_MAX_WAIT_MS - now);
+  // 若同用户还有图片/文件正在下载解密中，合并窗口未达 20 秒上限前顺延等待，避免文字 2 秒到期抢跑拆成两条
+  const downloading = group.length < MERGE_MAX_MESSAGES && maxRemainMs > 0 && hasMediaDownloading(first.task.from_user_id, MERGE_MEDIA_DOWNLOAD_MAX_AGE_MS);
+  const waitMs = downloading ? Math.max(baseWaitMs, Math.min(MERGE_MEDIA_DOWNLOAD_POLL_MS, maxRemainMs)) : baseWaitMs;
+  return { files: group.map((g) => g.fileName), waitMs, newest, extendedByMedia: downloading && baseWaitMs === 0 };
 }
 // 合成一条：按顺序编号，用最新那条的回复凭证；parts 留着原文（「用 GPT …」是哪一条说的都认）
 function mergeTasks(tasks, nickname) {
@@ -2082,6 +2090,7 @@ function mergeTasks(tasks, nickname) {
 }
 // 等的时候：先显示"正在输入"（每来一条新消息发一次），到点再处理
 const typingShownFor = new Set();
+const downloadWaitLoggedFor = new Set();
 let pumpWakeTimer = null;
 function waitForBatch(batch) {
   const { fileName, task } = batch.newest;
@@ -2092,6 +2101,11 @@ function waitForBatch(batch) {
     try {
       if (task.from_user_id && task.context_token) sendWechatTyping(task.from_user_id, task.context_token, 1, loadConfig(), { quiet: true }).catch(() => {});
     } catch {}
+  }
+  if (batch.extendedByMedia && !downloadWaitLoggedFor.has(fileName)) {
+    downloadWaitLoggedFor.add(fileName);
+    if (downloadWaitLoggedFor.size > 100) downloadWaitLoggedFor.delete(downloadWaitLoggedFor.values().next().value);
+    console.log('[合并等待] 检测到同用户有媒体正在下载，顺延合并窗口等待落盘');
   }
   if (pumpWakeTimer) clearTimeout(pumpWakeTimer);
   pumpWakeTimer = setTimeout(() => {

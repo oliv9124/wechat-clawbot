@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { sendWechatReply, loadConfig, loadRuntimeState, saveRuntimeState, describeText, writeJsonAtomic } from './wechat_reply.js';
+import { sendWechatReply, uploadAndSendWechatImage, loadConfig, loadRuntimeState, saveRuntimeState, describeText, describePath, writeJsonAtomic } from './wechat_reply.js';
 import { loadTopicsConfig, textAfterLastReset, listMemoryFiles, capForLoading, charCount, MEMORY_MAX_CHARS, TOPIC_MAX_CHARS } from './memory_config.js';
 import {
   prepareWorkCopy, discardWorkCopy, collectChanges, checkChanges, applyChanges, slimFile, overLimitFiles, agyPlanAgent,
@@ -211,7 +211,8 @@ function taskProblem(tasks) {
     if (!Number.isInteger(t.hour) || t.hour < 0 || t.hour > 23 || !Number.isInteger(t.minute) || t.minute < 0 || t.minute > 59) {
       return `${label}的时间不对（hour 要 0~23，minute 要 0~59）`;
     }
-    if (typeof t.generateCopy !== 'function') return `${label}缺少 generateCopy`;
+    if (t.digestOnly && !t.memoryDigest) return `${label}设了 digestOnly 但没设 memoryDigest`;
+    if (!t.digestOnly && typeof t.generateCopy !== 'function') return `${label}缺少 generateCopy`;
   }
   return '';
 }
@@ -294,15 +295,18 @@ async function checkAndTrigger() {
       updateState((s) => {
         s.last_fired = { ...(s.last_fired || {}), [task.id]: todayStr };
       });
-      await deliverTask(task, { todayStr });
+      await deliverTask(task, { todayStr, digestOnly: Boolean(task.digestOnly) });
     }
   }
 }
 
 /**
  * 发一个定时任务。标了 memoryDigest 的播报（早间天气）：播报一条，这个实例自己的"记忆变动"另发一条；
+ * 若同时标了 digestOnly: true，则作为独立的纯"记忆变动"定时任务（不发正文、无变动时安静跳过）。
+ * generateCopy 可返回纯文本，也可返回 { imagePath, text }：优先发送图片卡片，图片发送失败（非窗口关闭）时降级发 text；
+ * 仅在补发或触发 12h 互动提醒时附发一条简短文字，平时只推 1 张图。
  * 记忆变动没发出去就留到下一次一起列。微信窗口关着、没送达的早间播报记进 missed，对方当天回消息时补发。
- *   late：补发时原本的时间（"08:30"），播报末尾写明是补发；digestOnly：播报已经发过了，只补记忆变动
+ *   late：补发时原本的时间（"08:30"），播报末尾写明是补发；digestOnly：只发记忆变动（独立任务或只补记忆变动）
  * 返回 'sent' | 'window'（窗口关着，有东西留着等补发）| 'failed'
  */
 async function deliverTask(task, { todayStr, late = '', digestOnly = false }) {
@@ -326,28 +330,63 @@ async function deliverTask(task, { todayStr, late = '', digestOnly = false }) {
 
     // 每次发送都用最新的 context_token：现写文案可能要一两分钟，这期间对方也许发了新消息
     const send = (text) => sendWechatReply(userId, loadRuntimeState('forwarder').last_context_token, text, config);
-    const msgText = digestOnly ? '' : await task.generateCopy();
+    const sendImage = (imagePath) => uploadAndSendWechatImage(userId, loadRuntimeState('forwarder').last_context_token, imagePath, config);
+    const rawCopy = digestOnly ? '' : await task.generateCopy();
+    const isObjCopy = Boolean(rawCopy && typeof rawCopy === 'object');
+    const msgImagePath = isObjCopy ? String(rawCopy.imagePath || '').trim() : '';
+    const msgText = isObjCopy ? String(rawCopy.text || '') : String(rawCopy ?? '');
     const digest = !task.memoryDigest ? null : MEMORY_REVIEW ? memoryDigest() : MEMORY_MODE === 'managed' ? pendingDigest() : null;
     const digestCount = digest ? digest.items?.length ?? digest.count : 0;
     if (digestOnly && !digest) {
-      console.log(`[记忆变动不用补发]: ${task.name}，已经没有待发的了`);
+      console.log(`[${late ? '记忆变动不用补发' : '记忆变动无变化'}]: ${task.name}，${late ? '已经没有待发的了' : '没有新的改动'}`);
       return 'sent';
     }
     let sentText = '';
+    let imageDelivered = false;
 
     if (!digestOnly) {
-      const lateNote = late ? `\n（这条播报原本是今天 ${late} 的，当时微信不让${config.bot_name || '小助理'}主动发，现在补上。）` : '';
-      const text = `${msgText}${lateNote}`;
-      const nudge = withReplyNudge(text, config);
-      console.log(`[生成文案]: ${describeText(nudge.text)}${digest ? `（附记忆变动 ${digestCount} 条）` : ''}${nudge.text !== text ? '（末尾请对方回一句）' : ''}${late ? '（补发）' : ''}`);
-      try {
-        await send(nudge.text);
-      } catch (sendErr) {
-        nudge.undo();
-        throw sendErr;
+      const lateNote = late ? `（这条播报原本是今天 ${late} 的，当时微信不让${config.bot_name || '小助理'}主动发，现在补上。）` : '';
+      if (msgImagePath) {
+        console.log(`[生成图片卡片]: ${describePath(msgImagePath)}${digest ? `（附记忆变动 ${digestCount} 条）` : ''}${late ? '（补发）' : ''}`);
+        try {
+          await sendImage(msgImagePath);
+          imageDelivered = true;
+        } catch (imgErr) {
+          if (isWindowClosedError(imgErr) || !msgText.trim()) throw imgErr;
+          console.warn(`[定时任务图片发送失败，降级为纯文字]: ${task.name} (${imgErr.message})`);
+        }
       }
-      sentText = nudge.text;
-      appendDailyChat('定时', text);
+      if (imageDelivered) {
+        const nudge = withReplyNudge(lateNote, config);
+        const extraNote = nudge.text.trim();
+        if (extraNote) {
+          try {
+            await send(extraNote);
+          } catch (noteErr) {
+            nudge.undo();
+            if (isWindowClosedError(noteErr)) {
+              console.warn(`[附注文字未送达]: ${task.name}（微信窗口已关闭）`);
+              markReplyWindowClosed();
+            } else {
+              console.warn(`[附注文字发送失败]: ${task.name}`, noteErr.message);
+            }
+          }
+        }
+        sentText = msgText ? `[图片卡片] ${msgText}` : `[图片卡片] ${path.basename(msgImagePath)}`;
+        appendDailyChat('定时', sentText);
+      } else {
+        const text = lateNote ? `${msgText}\n${lateNote}` : msgText;
+        const nudge = withReplyNudge(text, config);
+        console.log(`[生成文案]: ${describeText(nudge.text)}${digest ? `（附记忆变动 ${digestCount} 条）` : ''}${nudge.text !== text ? '（末尾请对方回一句）' : ''}${late ? '（补发）' : ''}`);
+        try {
+          await send(nudge.text);
+        } catch (sendErr) {
+          nudge.undo();
+          throw sendErr;
+        }
+        sentText = nudge.text;
+        appendDailyChat('定时', text);
+      }
     }
 
     let digestLeft = false;
@@ -376,11 +415,13 @@ async function deliverTask(task, { todayStr, late = '', digestOnly = false }) {
 
     // 聊天日志里不写汇报的内容（免得被凌晨整理当成对话），只记条数
     if (digestOnly) {
-      appendLog(`[记忆变动补发成功] ${task.name}: ${digestCount} 条`);
-      console.log(`✅ [记忆变动补发完成]: ${task.name}\n`);
+      const label = late ? '记忆变动补发' : '记忆变动播报';
+      appendLog(`[${label}成功] ${task.name}: ${digestCount} 条`);
+      console.log(`✅ [${label}完成]: ${task.name}\n`);
       return 'sent';
     }
-    const what = !digest ? sentText : `${msgText}（${digestLeft ? `记忆变动 ${digestCount} 条没发出去，留着` : `附记忆变动 ${digestCount} 条`}）`;
+    const summaryText = imageDelivered ? sentText : msgText;
+    const what = !digest ? sentText : `${summaryText}（${digestLeft ? `记忆变动 ${digestCount} 条没发出去，留着` : `附记忆变动 ${digestCount} 条`}）`;
     appendLog(`[定时任务成功] ${task.name}${late ? '（补发）' : ''}: ${what}`);
     console.log(`✅ [定时任务下发完成]: ${task.name}${late ? '（补发）' : ''}\n`);
     return digestLeft && replyWindow().closed_at ? 'window' : 'sent';
@@ -420,7 +461,7 @@ async function catchUpMissedBroadcasts() {
         continue;
       }
       if (replyWindow().closed_at) continue;
-      console.log(`\n📮 [补发早间播报]: ${task.name}（原本 ${m.at}${m.digestOnly ? '，播报已经发了，只补记忆变动' : ''}）`);
+      console.log(`\n📮 [补发早间播报]: ${task.name}（原本 ${m.at}${m.digestOnly ? (task.digestOnly ? '，只发记忆变动' : '，播报已经发了，只补记忆变动') : ''}）`);
       const result = await deliverTask(task, { todayStr, late: m.at, digestOnly: Boolean(m.digestOnly) });
       if (result !== 'window') {
         updateState((s) => {

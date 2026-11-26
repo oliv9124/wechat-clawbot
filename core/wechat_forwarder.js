@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, loadRuntimeState, saveRuntimeState, describeText, describePath, LOG_CONTENT, mergeRecentTokens } from './wechat_reply.js';
-import { enqueueInbox } from './inbox.js';
+import { enqueueInbox, markMediaDownloading, clearMediaDownloading, clearAllMediaDownloading } from './inbox.js';
 import { raiseAlert } from './alert.js';
 
 // 凭证过期后多久再试一次：退出重启只会每几秒撞一次接口，没有意义（环境变量仅供测试缩短）
@@ -152,6 +152,10 @@ async function startPolling() {
   console.log(`[转发程序已启动] 正在通过 iLink 长轮询监听微信消息...`);
   console.log(`已绑定用户: ${config.authorized_user_id || '（未绑定，将拒收所有消息，请运行 login.js 扫码绑定）'}`);
   console.log(`消息收件箱: ${path.join(botRoot, 'data', 'inbox', 'pending')}`);
+  const clearedMarkers = clearAllMediaDownloading();
+  if (clearedMarkers > 0) {
+    console.log(`[收件箱] 启动时已清理 ${clearedMarkers} 个残留的媒体下载占位标记。`);
+  }
 
   const start = resolveStartCursor();
   let getUpdatesBuf = start.cursor;
@@ -280,98 +284,110 @@ async function startPolling() {
 
         // 提取文本内容与各类媒体（图片、语音、文档文件、视频）
         const items = msg.item_list || [];
-        let text = '';
-        const imagePaths = [];
-        const filePaths = [];
-        const voiceTexts = [];
+        const hasMediaItem = items.some((item) => (
+          (item.type === 2 && item.image_item)
+          || (item.type === 3 && item.voice_item)
+          || (item.type === 4 && item.file_item)
+          || (item.type === 5 && item.video_item)
+        ));
+        // 先放占位标记再下载，enqueueInbox 落盘后在 finally 里删掉，防止 routine 合并窗口在下载期间提前发车
+        const downloadingMarker = hasMediaItem ? markMediaDownloading(messageId, fromUser) : null;
+        try {
+          let text = '';
+          const imagePaths = [];
+          const filePaths = [];
+          const voiceTexts = [];
 
-        for (const item of items) {
-          // 1: 纯文本
-          if (item.type === 1 && item.text_item && item.text_item.text) {
-            text += item.text_item.text;
-          }
-          // 2: 图片
-          else if (item.type === 2 && item.image_item) {
-            const imgPath = await downloadAndDecryptMedia(item.image_item, '.jpg');
-            if (imgPath) {
-              imagePaths.push(imgPath);
+          for (const item of items) {
+            // 1: 纯文本
+            if (item.type === 1 && item.text_item && item.text_item.text) {
+              text += item.text_item.text;
+            }
+            // 2: 图片
+            else if (item.type === 2 && item.image_item) {
+              const imgPath = await downloadAndDecryptMedia(item.image_item, '.jpg');
+              if (imgPath) {
+                imagePaths.push(imgPath);
+              }
+            }
+            // 3: 语音 (带腾讯官方微信高精度 ASR 识别文本)
+            else if (item.type === 3 && item.voice_item) {
+              if (item.voice_item.text) {
+                voiceTexts.push(item.voice_item.text.trim());
+                console.log(`[微信语音识别 ASR]: ${describeText(item.voice_item.text)}`);
+              }
+              const voicePath = await downloadAndDecryptMedia(item.voice_item, '.silk');
+              if (voicePath && !item.voice_item.text) {
+                filePaths.push({ path: voicePath, name: path.basename(voicePath) });
+              }
+            }
+            // 4: 文件 / 文档 (代码、PDF、Word、Excel、Zip、Txt 等)
+            else if (item.type === 4 && item.file_item) {
+              const fileName = item.file_item.file_name || 'document.bin';
+              const ext = path.extname(fileName) || '.bin';
+              const filePath = await downloadAndDecryptMedia(item.file_item, ext, fileName);
+              if (filePath) {
+                filePaths.push({ path: filePath, name: fileName });
+                console.log(`[微信接收文件]: ${describePath(filePath)}`);
+              }
+            }
+            // 5: 视频
+            else if (item.type === 5 && item.video_item) {
+              const videoPath = await downloadAndDecryptMedia(item.video_item, '.mp4');
+              if (videoPath) {
+                filePaths.push({ path: videoPath, name: 'video.mp4' });
+              }
+            }
+
+            // 引用消息解析
+            if (item.ref_msg) {
+              const refTitle = item.ref_msg.title || '';
+              if (refTitle) {
+                text = `[引用微信消息: ${refTitle}]\n${text}`;
+              }
             }
           }
-          // 3: 语音 (带腾讯官方微信高精度 ASR 识别文本)
-          else if (item.type === 3 && item.voice_item) {
-            if (item.voice_item.text) {
-              voiceTexts.push(item.voice_item.text.trim());
-              console.log(`[微信语音识别 ASR]: ${describeText(item.voice_item.text)}`);
-            }
-            const voicePath = await downloadAndDecryptMedia(item.voice_item, '.silk');
-            if (voicePath && !item.voice_item.text) {
-              filePaths.push({ path: voicePath, name: path.basename(voicePath) });
-            }
-          }
-          // 4: 文件 / 文档 (代码、PDF、Word、Excel、Zip、Txt 等)
-          else if (item.type === 4 && item.file_item) {
-            const fileName = item.file_item.file_name || 'document.bin';
-            const ext = path.extname(fileName) || '.bin';
-            const filePath = await downloadAndDecryptMedia(item.file_item, ext, fileName);
-            if (filePath) {
-              filePaths.push({ path: filePath, name: fileName });
-              console.log(`[微信接收文件]: ${describePath(filePath)}`);
-            }
-          }
-          // 5: 视频
-          else if (item.type === 5 && item.video_item) {
-            const videoPath = await downloadAndDecryptMedia(item.video_item, '.mp4');
-            if (videoPath) {
-              filePaths.push({ path: videoPath, name: 'video.mp4' });
-            }
+
+          // 拼接语音转写文本
+          if (voiceTexts.length > 0) {
+            const vText = voiceTexts.join(' ');
+            text = text.trim() ? `${text}\n[用户微信语音内容]: ${vText}` : vText;
           }
 
-          // 引用消息解析
-          if (item.ref_msg) {
-            const refTitle = item.ref_msg.title || '';
-            if (refTitle) {
-              text = `[引用微信消息: ${refTitle}]\n${text}`;
-            }
+          // 拼接图片提示
+          if (imagePaths.length > 0) {
+            const imgPrompt = imagePaths.map((p) => `[已接收用户发送的图片文件: ${p}，请查看此图片进行识别分析]`).join(' ');
+            text = text.trim() ? `${text}\n${imgPrompt}` : `请查看并详细分析用户在微信发送的这张图片: ${imagePaths.join(', ')}`;
           }
-        }
 
-        // 拼接语音转写文本
-        if (voiceTexts.length > 0) {
-          const vText = voiceTexts.join(' ');
-          text = text.trim() ? `${text}\n[用户微信语音内容]: ${vText}` : vText;
-        }
+          // 拼接文件提示
+          if (filePaths.length > 0) {
+            const filePrompt = filePaths
+              .map((f) => `[已接收用户在微信发送的文件: ${f.path} (原文件名: ${f.name})，请根据需要阅读或处理该文件]`)
+              .join('\n');
+            text = text.trim() ? `${text}\n${filePrompt}` : filePrompt;
+          }
 
-        // 拼接图片提示
-        if (imagePaths.length > 0) {
-          const imgPrompt = imagePaths.map((p) => `[已接收用户发送的图片文件: ${p}，请查看此图片进行识别分析]`).join(' ');
-          text = text.trim() ? `${text}\n${imgPrompt}` : `请查看并详细分析用户在微信发送的这张图片: ${imagePaths.join(', ')}`;
-        }
+          if (!text.trim()) {
+            console.log('[收到空消息或未支持的媒体类型，暂不处理]');
+            seenIds.add(messageId);
+            continue;
+          }
 
-        // 拼接文件提示
-        if (filePaths.length > 0) {
-          const filePrompt = filePaths
-            .map((f) => `[已接收用户在微信发送的文件: ${f.path} (原文件名: ${f.name})，请根据需要阅读或处理该文件]`)
-            .join('\n');
-          text = text.trim() ? `${text}\n${filePrompt}` : filePrompt;
-        }
+          console.log(`\n[微信收到用户指令] ${describeText(text)}（图片 ${imagePaths.length}，文件 ${filePaths.length}）`);
 
-        if (!text.trim()) {
-          console.log('[收到空消息或未支持的媒体类型，暂不处理]');
+          // 落进收件箱，由 routine 按顺序取走处理；routine 暂时不在线也不会丢
+          enqueueInbox({
+            message_id: messageId,
+            create_time_ms: msg.create_time_ms || Date.now(),
+            from_user_id: fromUser,
+            message_text: text,
+            context_token: msg.context_token,
+          });
           seenIds.add(messageId);
-          continue;
+        } finally {
+          clearMediaDownloading(downloadingMarker);
         }
-
-        console.log(`\n[微信收到用户指令] ${describeText(text)}（图片 ${imagePaths.length}，文件 ${filePaths.length}）`);
-
-        // 落进收件箱，由 routine 按顺序取走处理；routine 暂时不在线也不会丢
-        enqueueInbox({
-          message_id: messageId,
-          create_time_ms: msg.create_time_ms || Date.now(),
-          from_user_id: fromUser,
-          message_text: text,
-          context_token: msg.context_token,
-        });
-        seenIds.add(messageId);
       }
 
       // 整批消息都已落盘，才推进同步游标；中途崩溃会重新拉到这批，靠 message_id 去重

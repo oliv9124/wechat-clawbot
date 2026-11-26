@@ -8,6 +8,7 @@ import { writeJsonAtomic } from './wechat_reply.js';
  *
  *   <实例目录>/data/inbox/pending/     等待处理
  *   <实例目录>/data/inbox/processing/  正在处理
+ *   <实例目录>/data/inbox/downloading/ forwarder 正在下载解密的媒体占位标记（防止合并窗口抢跑）
  *   <实例目录>/data/inbox/failed/      反复出错、放弃处理的消息（需要人工查看）
  */
 function inboxDir(name) {
@@ -76,4 +77,66 @@ export function requeueProcessing() {
     count++;
   }
   return count;
+}
+
+// forwarder 收到含媒体的消息时先写占位标记，下载解密并 enqueueInbox 后再删掉，
+// 让 routine 的合并窗口知道“后面还有图片/文件正在下载”，避免纯文字 2 秒到期直接抢跑。
+export function markMediaDownloading(messageId, fromUserId) {
+  const id = String(messageId || Date.now()).replace(/[^0-9A-Za-z_-]/g, '_');
+  const file = path.join(inboxDir('downloading'), `${Date.now()}-${id}.json`);
+  writeJsonAtomic(file, { message_id: messageId, from_user_id: fromUserId, started_at: Date.now() });
+  return file;
+}
+
+export function clearMediaDownloading(markerPath) {
+  if (!markerPath) return;
+  try {
+    fs.rmSync(markerPath, { force: true });
+  } catch {}
+}
+
+export function clearAllMediaDownloading() {
+  const dir = path.join(process.cwd(), 'data', 'inbox', 'downloading');
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const f of entries) {
+    if (!f.endsWith('.json')) continue;
+    try {
+      fs.rmSync(path.join(dir, f), { force: true });
+      count++;
+    } catch {}
+  }
+  return count;
+}
+
+export function hasMediaDownloading(fromUserId, maxAgeMs = 30_000) {
+  const dir = path.join(process.cwd(), 'data', 'inbox', 'downloading');
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  const now = Date.now();
+  for (const f of entries) {
+    if (!f.endsWith('.json')) continue;
+    const p = path.join(dir, f);
+    try {
+      const age = now - fs.statSync(p).mtimeMs;
+      if (age > maxAgeMs) {
+        if (age > maxAgeMs * 2) {
+          try { fs.rmSync(p, { force: true }); } catch {}
+        }
+        continue;
+      }
+      const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
+      if (!fromUserId || data.from_user_id === fromUserId) return true;
+    } catch {}
+  }
+  return false;
 }
